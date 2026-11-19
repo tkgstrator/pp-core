@@ -1,5 +1,5 @@
-use super::{BASE, PP6_HASH, digest, glyph_table, hex, quote, word, write_file};
 use super::semantic::{self, Command};
+use super::{BASE, PP6_HASH, digest, glyph_table, hex, quote, word, write_file};
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -348,53 +348,155 @@ fn decode(
     Ok((rows, transcript, menus, unknown))
 }
 
-fn semantic_commands(rom: &[u8], desc: usize, end: usize, rows: &[Row],
-    scene_ids: &BTreeMap<usize,String>) -> Vec<Command> {
-    let labels=semantic::labels(rows.iter().map(|row|row.at));
-    rows.iter().map(|row| {
-        let raw=&row.raw;
-        match row.kind.as_str() {
-            "TEXT" => Command::new("TEXT").text("text",row.text.as_ref().unwrap()[0].clone()),
-            "LINE" => Command::new("LINE"),
-            "PAGE" => Command::new("PAGE"),
-            "END_OR_RETURN" => Command::new("END_OR_RETURN"),
-            "BG" => Command::new("EFFECT").text("effect","background").number("asset_id",raw[1] as usize),
-            "PORTRAIT_LEFT" => Command::new("EFFECT").text("effect","portrait").text("side","left").number("asset_id",raw[1] as usize),
-            "PORTRAIT_RIGHT" => Command::new("EFFECT").text("effect","portrait").text("side","right").number("asset_id",raw[1] as usize),
-            "CHOICE" => Command::new("CHOICE").texts("options",row.text.clone().unwrap_or_default()),
-            "CONDITIONAL" => semantic::condition(rom,raw,row.at+raw.len(),end,&labels),
-            "SKIP_TO_MARKER" => {
-                let marker=match raw[1] { 0x2e=>0x2f,0x37=>0x38,0x40=>0x41,0x49=>0x4a,_=>0x21 };
-                semantic::branch(rom,row.at+raw.len(),end,marker,&labels)
+fn semantic_commands(
+    rom: &[u8],
+    desc: usize,
+    end: usize,
+    rows: &[Row],
+    scene_ids: &BTreeMap<usize, String>,
+    state_ids: &BTreeMap<usize, String>,
+) -> Vec<Command> {
+    let labels = semantic::labels(rows.iter().map(|row| row.at));
+    rows.iter()
+        .map(|row| {
+            let raw = &row.raw;
+            match row.kind.as_str() {
+                "TEXT" => Command::new("TEXT").text("text", row.text.as_ref().unwrap()[0].clone()),
+                "LINE" => Command::new("LINE"),
+                "PAGE" => Command::new("PAGE"),
+                "END_OR_RETURN" => Command::new("END_OR_RETURN"),
+                "BG" => Command::new("EFFECT")
+                    .text("effect", "background")
+                    .number("asset_id", raw[1] as usize),
+                "PORTRAIT_LEFT" => Command::new("EFFECT")
+                    .text("effect", "portrait")
+                    .text("side", "left")
+                    .number("asset_id", raw[1] as usize),
+                "PORTRAIT_RIGHT" => Command::new("EFFECT")
+                    .text("effect", "portrait")
+                    .text("side", "right")
+                    .number("asset_id", raw[1] as usize),
+                "CHOICE" => {
+                    Command::new("CHOICE").texts("options", row.text.clone().unwrap_or_default())
+                }
+                "CONDITIONAL" => semantic::condition(
+                    rom,
+                    raw,
+                    row.at + raw.len(),
+                    end,
+                    &labels,
+                    true,
+                    &state_ids[&word(rom, desc + 4 + 4 * raw[3] as usize)],
+                ),
+                "SKIP_TO_MARKER" => {
+                    let marker = match raw[1] {
+                        0x2e => 0x2f,
+                        0x37 => 0x38,
+                        0x40 => 0x41,
+                        0x49 => 0x4a,
+                        _ => 0x21,
+                    };
+                    semantic::branch(rom, row.at + raw.len(), end, marker, &labels)
+                }
+                "MARKER" => Command::new("MARKER"),
+                "CALL_EVENT" => {
+                    let target = word(rom, desc + 4 + 4 * raw[2] as usize).wrapping_sub(BASE);
+                    scene_ids
+                        .get(&target)
+                        .map(|id| Command::new("CALL").text("target", id))
+                        .unwrap_or_else(semantic::unknown)
+                }
+                "INDEXED_BRANCH" => semantic::switch(
+                    rom,
+                    row.at + raw.len(),
+                    end,
+                    &state_ids[&word(rom, desc + 4 + 4 * raw[2] as usize)],
+                    &labels,
+                ),
+                "WAIT_PAGE" => Command::new("WAIT").text("until", "page_ack"),
+                "TEXT_COLOR" => Command::new("EFFECT").text("effect", "text_style").text(
+                    "mode",
+                    if raw[1] == 0x08 {
+                        "emphasis"
+                    } else {
+                        "restore"
+                    },
+                ),
+                "PLAYER_NAME" => Command::new("PLAYER_NAME"),
+                kind if kind.ends_with("_U8")
+                    || kind.ends_with("_U16")
+                    || kind.ends_with("_U32") =>
+                {
+                    let (action, width) = kind.rsplit_once("_U").unwrap();
+                    let mapped = match action {
+                        "SET" => "SET",
+                        "ADD" => "ADD",
+                        "SUBTRACT" => "SUBTRACT",
+                        "AND" => "BIT_AND",
+                        "COPY" => "COPY",
+                        "OR" => "BIT_OR",
+                        _ => return semantic::unknown(),
+                    };
+                    let mut command = Command::new(mapped)
+                        .text(
+                            "variable",
+                            &state_ids[&word(rom, desc + 4 + 4 * raw[2] as usize)],
+                        )
+                        .text("value_type", format!("u{width}"));
+                    if mapped == "COPY" {
+                        command = command.text(
+                            "source",
+                            &state_ids[&word(rom, desc + 4 + 4 * raw[3] as usize)],
+                        );
+                    } else {
+                        command = command.number(
+                            "value",
+                            raw[3..].iter().fold(0usize, |a, b| (a << 8) | *b as usize),
+                        );
+                    }
+                    command
+                }
+                _ => semantic::unknown(),
             }
-            "MARKER" => Command::new("MARKER"),
-            "CALL_EVENT" => {
-                let target=word(rom,desc+4+4*raw[2] as usize).wrapping_sub(BASE);
-                scene_ids.get(&target).map(|id|Command::new("CALL").text("target",id))
-                    .unwrap_or_else(semantic::unknown)
-            }
-            "INDEXED_BRANCH" => semantic::switch(rom,row.at+raw.len(),end,raw[2],&labels),
-            "WAIT_PAGE" => Command::new("WAIT").text("until","page_ack"),
-            "TEXT_COLOR" => Command::new("EFFECT").text("effect","text_style").text("mode",if raw[1]==0x08 { "emphasis" } else { "restore" }),
-            "PLAYER_NAME" => Command::new("PLAYER_NAME"),
-            kind if kind.ends_with("_U8") || kind.ends_with("_U16") || kind.ends_with("_U32") => {
-                let (action,width)=kind.rsplit_once("_U").unwrap();
-                let mapped=match action { "SET"=>"SET","ADD"=>"ADD","SUBTRACT"=>"SUBTRACT","AND"=>"BIT_AND","COPY"=>"COPY","OR"=>"BIT_OR",_=>return semantic::unknown() };
-                let mut command=Command::new(mapped).text("variable",format!("slot_{}",raw[2])).text("value_type",format!("u{width}"));
-                if mapped=="COPY" { command=command.text("source",format!("slot_{}",raw[3])); }
-                else { command=command.number("value",raw[3..].iter().fold(0usize,|a,b|(a<<8)|*b as usize)); }
-                command
-            }
-            _ => semantic::unknown(),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()> {
     let events = discover(rom)?;
-    let scene_ids=events.keys().enumerate().map(|(i,desc)|(*desc,semantic::scene_id("pp6",i+1))).collect::<BTreeMap<_,_>>();
-    let mut semantic_index=String::from("scene_id\tscene_file\tnative_scene\n");
     let starts: Vec<_> = events.values().map(|e| e.start).collect();
+    let chars = glyph_table(true);
+    let scene_ids = events
+        .keys()
+        .enumerate()
+        .map(|(i, desc)| (*desc, semantic::scene_id("pp6", i + 1)))
+        .collect::<BTreeMap<_, _>>();
+    let mut state_words = BTreeSet::new();
+    for (desc, event) in &events {
+        let i = starts.partition_point(|&s| s < *desc);
+        let ref_end = starts.get(i).copied().unwrap_or(END);
+        let (rows, _, _, _) = decode(rom, *desc, event.start, event.end, ref_end, &chars)?;
+        for row in rows {
+            let raw = &row.raw;
+            let indexes: Vec<u8> = match row.kind.as_str() {
+                "CONDITIONAL" => vec![raw[3]],
+                "INDEXED_BRANCH" => vec![raw[2]],
+                "COPY_U8" | "COPY_U16" | "COPY_U32" => vec![raw[2], raw[3]],
+                kind if kind.ends_with("_U8")
+                    || kind.ends_with("_U16")
+                    || kind.ends_with("_U32") =>
+                {
+                    vec![raw[2]]
+                }
+                _ => vec![],
+            };
+            for index in indexes {
+                state_words.insert(word(rom, *desc + 4 + 4 * index as usize));
+            }
+        }
+    }
+    let state_ids = semantic::state_ids("pp6", state_words);
+    let mut semantic_index = String::from("scene_id\tscene_file\tnative_scene\n");
     let mut schedule = String::from(
         "grid\tmajor_index\tmonth_index\tslot_index\trom_offset\tencoded_id\tevent_id\tdescriptor\n",
     );
@@ -437,16 +539,19 @@ pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()>
     let mut unresolved: BTreeMap<String, usize> = BTreeMap::new();
     let mut count_choices = 0;
     let mut raw_bytes = 0;
-    let chars = glyph_table(true);
     for (desc, event) in &events {
         let i = starts.partition_point(|&s| s < *desc);
         let ref_end = starts.get(i).copied().unwrap_or(END);
         let (rows, plain, menus, unknown) =
             decode(rom, *desc, event.start, event.end, ref_end, &chars)?;
-        let scene_id=&scene_ids[desc];
-        let commands=semantic_commands(rom,*desc,event.end,&rows,&scene_ids);
-        let scene_file=semantic::write_scene(semantic_out,"pp6",scene_id,&commands)?;
-        writeln!(semantic_index,"{scene_id}\t{scene_file}\tnative/scenes/{:02x}/{desc:06x}.yaml",desc>>16)?;
+        let scene_id = &scene_ids[desc];
+        let commands = semantic_commands(rom, *desc, event.end, &rows, &scene_ids, &state_ids);
+        let scene_file = semantic::write_scene(semantic_out, "pp6", scene_id, &commands)?;
+        writeln!(
+            semantic_index,
+            "{scene_id}\t{scene_file}\tnative/scenes/{:02x}/{desc:06x}.yaml",
+            desc >> 16
+        )?;
         let relative = format!("scenes/{:02x}/{desc:06x}.txt", desc >> 16);
         let mut listing = format!(
             "PP6  台本 0x{desc:06x}\n本文 0x{:06x}–0x{:06x} (終端の次)\n\n{plain}\n\n［命令と原バイト列］\nROM位置\tバイト列\t種別\t内容\n",
@@ -576,6 +681,7 @@ pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()>
         unresolved.values().sum::<usize>()
     );
     write_file(&out.join("summary.json"), &summary)?;
-    write_file(&semantic_out.join("index.tsv"),&semantic_index)?;
+    write_file(&semantic_out.join("index.tsv"), &semantic_index)?;
+    semantic::write_state_index(semantic_out, &state_ids)?;
     Ok(())
 }

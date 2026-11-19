@@ -1,18 +1,21 @@
 use ppextractor::{Game, fonts};
 use serde_json::Value;
-use std::path::Path;
+
+#[allow(dead_code)]
+#[path = "../src/test_assets.rs"]
+mod test_assets;
 
 fn parity(game: Game, name: &str) {
-    let source = Path::new("/Users/devonly/Developer/biccame-pocket/assets");
-    let rom_path = source.join("roms").join(format!("{name}.gba"));
-    if !rom_path.exists() {
-        eprintln!("skipping unavailable ROM: {}", rom_path.display());
+    let Some(rom_path) = test_assets::rom(name) else {
         return;
-    }
-    let rom = std::fs::read(rom_path).unwrap();
+    };
+    let Some(expected) = test_assets::oracle(name, "fonts", "glyphs.json") else {
+        return;
+    };
+    let verified = ppextractor::verify_rom(&rom_path).unwrap();
+    assert_eq!(verified.game, game);
     let temp = tempfile::tempdir().unwrap();
-    fonts::extract(&rom, temp.path(), game).unwrap();
-    let expected = source.join("extracted").join(name).join("fonts");
+    fonts::extract(&verified.bytes, temp.path(), game).unwrap();
 
     let got = image::open(temp.path().join("glyphs.png"))
         .unwrap()

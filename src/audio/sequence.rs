@@ -556,7 +556,6 @@ pub(super) fn expand_percussion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::Path};
     #[test]
     fn note_cache_timing_and_pitch() {
         let data = [
@@ -574,11 +573,12 @@ mod tests {
     #[test]
     fn parent_percussion_nibble_reduces_child_noise_volume() {
         for (file, game, sound_id) in [("pp4", Game::Pp4, 0x40), ("pp6", Game::Pp6, 0x7b)] {
-            let path = format!("/Users/devonly/Developer/biccame-pocket/assets/roms/{file}.gba");
-            if !Path::new(&path).exists() {
+            let Some(path) = crate::test_assets::rom(file) else {
                 continue;
-            }
-            let rom = fs::read(path).unwrap();
+            };
+            let verified = crate::verify_rom(&path).unwrap();
+            assert_eq!(verified.game, game);
+            let rom = verified.bytes;
             let (sequences, ends) = super::super::scan_sequences(&rom, game).unwrap();
             let bank = super::super::scan_percussion(&rom, game).unwrap();
             let song = sequences["bgm"].iter().find(|s| s.id == sound_id).unwrap();

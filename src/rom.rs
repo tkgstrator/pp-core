@@ -131,7 +131,6 @@ mod tests {
 
     #[test]
     fn accepts_verified_local_roms_when_available() {
-        let dir = Path::new("/Users/devonly/Developer/biccame-pocket/assets/roms");
         for (file, expected_game, expected_digest) in [
             (
                 "pp4.gba",
@@ -144,11 +143,10 @@ mod tests {
                 "72b6a3913d69710f74e9f96c7175a42901cfac486e623c2af6750bb4d487b157",
             ),
         ] {
-            let path = dir.join(file);
-            if !path.exists() {
-                eprintln!("skipping unavailable local ROM: {}", path.display());
+            let Some(path) = crate::test_assets::rom(expected_game.id()) else {
                 continue;
-            }
+            };
+            assert_eq!(path.file_name().unwrap(), file);
             let rom = verify_rom(&path).unwrap();
             assert_eq!(rom.game, expected_game);
             assert_eq!(rom.sha256, expected_digest);

@@ -230,9 +230,6 @@ pub fn extract(rom: &[u8], out: &Path, _game: Game) -> Result<()> {
 mod tests {
     use super::*;
 
-    const ROMS: &str = "/Users/devonly/Developer/biccame-pocket/assets/roms";
-    const ORACLE: &str = "/Users/devonly/Developer/biccame-pocket/assets/extracted";
-
     #[test]
     fn rejects_garbage() {
         assert!(discover(&vec![0xFF; 4096]).is_empty());
@@ -257,15 +254,14 @@ mod tests {
     #[test]
     fn matches_python_oracle_when_available() {
         for (game, file) in [("pp4", "pp4.gba"), ("pp6", "pp6.gba")] {
-            let (rom_path, dir) = (
-                Path::new(ROMS).join(file),
-                Path::new(ORACLE).join(game).join("images"),
-            );
-            if !rom_path.exists() || !dir.join("catalog.tsv").exists() {
-                eprintln!("skipping {game}: ROM or oracle missing");
+            let Some(rom_path) = crate::test_assets::rom(game) else {
                 continue;
-            }
-            let rom = std::fs::read(rom_path).unwrap();
+            };
+            let Some(dir) = crate::test_assets::oracle(game, "images", "catalog.tsv") else {
+                continue;
+            };
+            assert_eq!(rom_path.file_name().unwrap(), file);
+            let rom = crate::verify_rom(&rom_path).unwrap().bytes;
             let oracle = std::fs::read_to_string(dir.join("catalog.tsv")).unwrap();
             let temp = tempfile::tempdir().unwrap();
             let counts = export(&rom, temp.path()).unwrap();

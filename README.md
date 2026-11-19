@@ -32,9 +32,25 @@ The output root contains a `4` (PP4) or `6` (PP6) folder with this layout:
 
 `--only images` extracts backgrounds only; it does not include portraits. Use `--only portraits` (or the default `all`) to fill `images/portraits`.
 
+## Scripts
+
+`scripts/scenes/*.yaml` contains the version 2 scene format. Each scene has an opaque `scene_id` and an ordered `commands` list. Commands use shared types such as `TEXT`, `EFFECT`, `CHOICE`, `WAIT`, `IF`, `SET`, `CALL`, and `JUMP`, with named fields. Scene and command IDs are identifiers, not ROM addresses. The primary YAML does not require `offset`, `bytes_hex`, or `args`.
+
+`scripts/index.tsv` links scene IDs to their YAML files. The original lossless ROM records, including raw bytes and offsets, are kept separately in `scripts/native/`; `scripts/state-links.tsv` records the source of opaque state IDs. `SE`, `BGM`, and `RETURN` are reserved command types until their dialogue opcode mappings are verified. `UNRESOLVED` marks instructions whose effects are still unknown, so these scenes are not yet a complete playable reconstruction. See [the script format](docs/script-format.md) for the command fields and limits.
+
+## Verification
+
+The public CI runs ROM-free tests, format and Clippy checks, and a smoke test of each release binary. To require full parity tests locally, provide an assets directory containing `roms/pp4.gba`, `roms/pp6.gba`, and the reference outputs under `extracted/pp4/` and `extracted/pp6/`:
+
+```sh
+PPEXTRACTOR_ASSETS_ROOT=/path/to/assets PPEXTRACTOR_REQUIRE_ROM_PARITY=1 cargo test --all-targets --locked
+```
+
+This mode fails if a ROM or reference output is missing. ROMs and reference outputs are not committed or packaged.
+
 ## Releases
 
-Prebuilt binaries for Linux (x86_64), macOS (Intel and Apple Silicon), and Windows (x86_64) are attached to each [GitHub Release](../../releases). Each archive (`.tar.gz` or `.zip`) contains the `ppextractor` executable and this README, and `SHA256SUMS.txt` lists the checksums:
+Prebuilt binaries for Linux (x86_64), macOS (Intel and Apple Silicon), and Windows (x86_64) are attached to each [GitHub Release](https://github.com/tkgstrator/ppextractor/releases). Each archive (`.tar.gz` or `.zip`) contains the `ppextractor` executable and this README, and `SHA256SUMS.txt` lists the checksums:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS.txt   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS.txt

@@ -7,4 +7,7 @@ pub mod portraits;
 pub mod rom;
 pub mod scripts;
 
+#[cfg(test)]
+mod test_assets;
+
 pub use rom::{Game, VerifiedRom, verify_rom};

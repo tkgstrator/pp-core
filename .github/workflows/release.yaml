@@ -53,6 +53,13 @@ jobs:
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Smoke test native release binary
+        shell: bash
+        run: |
+          exe="target/${{ matrix.target }}/release/ppextractor"
+          if [ "${{ matrix.archive }}" = "zip" ]; then exe="${exe}.exe"; fi
+          "$exe" supported
+
       - name: Package
         shell: bash
         run: |

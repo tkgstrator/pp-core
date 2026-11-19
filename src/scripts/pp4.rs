@@ -1,5 +1,5 @@
-use super::{BASE, PP4_HASH, decode_pp4, digest, glyph_table, hex, quote, word, write_file};
 use super::semantic::{self, Command};
+use super::{BASE, PP4_HASH, decode_pp4, digest, glyph_table, hex, quote, word, write_file};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -355,54 +355,122 @@ fn parse(
     })
 }
 
-fn semantic_commands(data: &[u8], desc: usize, end: usize, parsed: &Parsed,
-    scene_ids: &BTreeMap<usize,String>, chars: &[Option<char>]) -> Vec<Command> {
+fn semantic_commands(
+    data: &[u8],
+    desc: usize,
+    end: usize,
+    parsed: &Parsed,
+    scene_ids: &BTreeMap<usize, String>,
+    state_ids: &BTreeMap<usize, String>,
+    chars: &[Option<char>],
+) -> Vec<Command> {
     let labels = semantic::labels(parsed.rows.iter().map(|row| row.at));
-    parsed.rows.iter().map(|row| {
-        let raw=&row.raw;
-        match row.kind.as_str() {
-            "text" => Command::new("TEXT").text("text",&row.caption),
-            "newline" => Command::new("LINE"),
-            "page" => Command::new("PAGE"),
-            "scene" => Command::new("EFFECT").text("effect","background").number("asset_id",raw[1] as usize),
-            "actor_left" => Command::new("EFFECT").text("effect","portrait").text("side","left").number("asset_id",raw[1] as usize),
-            "actor_right" => Command::new("EFFECT").text("effect","portrait").text("side","right").number("asset_id",raw[1] as usize),
-            "end" => Command::new("END_OR_RETURN"),
-            "text_style_on" => Command::new("EFFECT").text("effect","text_style").text("mode","on"),
-            "text_style_restore" => Command::new("EFFECT").text("effect","text_style").text("mode","restore"),
-            "player_name" => Command::new("PLAYER_NAME"),
-            "choice" => {
-                if raw.len()<3 { return semantic::unknown(); }
-                let mut p=3;
-                let mut options=Vec::new();
-                for _ in 0..raw[2].max(2) {
-                    let begin=p;
-                    while p+1<raw.len() && raw[p..p+2]!=[0xf8,0xf8] {
-                        p+=if (0xe8..=0xf7).contains(&raw[p]) { 2 } else { 1 };
+    parsed
+        .rows
+        .iter()
+        .map(|row| {
+            let raw = &row.raw;
+            match row.kind.as_str() {
+                "text" => Command::new("TEXT").text("text", &row.caption),
+                "newline" => Command::new("LINE"),
+                "page" => Command::new("PAGE"),
+                "scene" => Command::new("EFFECT")
+                    .text("effect", "background")
+                    .number("asset_id", raw[1] as usize),
+                "actor_left" => Command::new("EFFECT")
+                    .text("effect", "portrait")
+                    .text("side", "left")
+                    .number("asset_id", raw[1] as usize),
+                "actor_right" => Command::new("EFFECT")
+                    .text("effect", "portrait")
+                    .text("side", "right")
+                    .number("asset_id", raw[1] as usize),
+                "end" => Command::new("END_OR_RETURN"),
+                "text_style_on" => Command::new("EFFECT")
+                    .text("effect", "text_style")
+                    .text("mode", "on"),
+                "text_style_restore" => Command::new("EFFECT")
+                    .text("effect", "text_style")
+                    .text("mode", "restore"),
+                "player_name" => Command::new("PLAYER_NAME"),
+                "choice" => {
+                    if raw.len() < 3 {
+                        return semantic::unknown();
                     }
-                    if p+2>raw.len() { return semantic::unknown(); }
-                    options.push(decode_pp4(&raw[begin..p],chars)); p+=2;
+                    let mut p = 3;
+                    let mut options = Vec::new();
+                    for _ in 0..raw[2].max(2) {
+                        let begin = p;
+                        while p + 1 < raw.len() && raw[p..p + 2] != [0xf8, 0xf8] {
+                            p += if (0xe8..=0xf7).contains(&raw[p]) {
+                                2
+                            } else {
+                                1
+                            };
+                        }
+                        if p + 2 > raw.len() {
+                            return semantic::unknown();
+                        }
+                        options.push(decode_pp4(&raw[begin..p], chars));
+                        p += 2;
+                    }
+                    Command::new("CHOICE").texts("options", options)
                 }
-                Command::new("CHOICE").texts("options",options)
+                "call_event" | "jump_event" => {
+                    let target = word(data, desc + 4 + 4 * raw[2] as usize).wrapping_sub(BASE);
+                    scene_ids
+                        .get(&target)
+                        .map(|id| {
+                            Command::new(if row.kind == "call_event" {
+                                "CALL"
+                            } else {
+                                "JUMP"
+                            })
+                            .text("target", id)
+                        })
+                        .unwrap_or_else(semantic::unknown)
+                }
+                "switch_u8" => semantic::switch(
+                    data,
+                    row.at + raw.len(),
+                    end,
+                    &state_ids[&word(data, desc + 4 + 4 * raw[2] as usize)],
+                    &labels,
+                ),
+                "leave_case" => semantic::branch(data, row.at + raw.len(), end, 0x21, &labels),
+                "end_switch" => Command::new("MARKER"),
+                "else_marker" => {
+                    semantic::branch(data, row.at + raw.len(), end, raw[1] + 1, &labels)
+                }
+                "indexed_tail" => {
+                    Command::new("INLINE_DATA").text("purpose", "indexed_jump_selectors")
+                }
+                kind if kind.starts_with("case_") => Command::new("MARKER"),
+                kind if kind.starts_with("op_")
+                    && raw.len() >= 2
+                    && ARGC[raw[1] as usize] == -3 =>
+                {
+                    semantic::condition(
+                        data,
+                        raw,
+                        row.at + raw.len(),
+                        end,
+                        &labels,
+                        false,
+                        &state_ids[&word(data, desc + 4 + 4 * raw[3] as usize)],
+                    )
+                }
+                kind if kind.starts_with("op_")
+                    && raw.len() == 3
+                    && raw[1] == raw[2]
+                    && matches!(raw[1], 0x21 | 0x2f | 0x38 | 0x41 | 0x4a) =>
+                {
+                    Command::new("MARKER")
+                }
+                _ => semantic::unknown(),
             }
-            "call_event"|"jump_event" => {
-                let target=word(data,desc+4+4*raw[2] as usize).wrapping_sub(BASE);
-                scene_ids.get(&target).map(|id|Command::new(if row.kind=="call_event" { "CALL" } else { "JUMP" }).text("target",id))
-                    .unwrap_or_else(semantic::unknown)
-            }
-            "switch_u8" => semantic::switch(data,row.at+raw.len(),end,raw[2],&labels),
-            "leave_case" => semantic::branch(data,row.at+raw.len(),end,0x21,&labels),
-            "end_switch" => Command::new("MARKER"),
-            "else_marker" => semantic::branch(data,row.at+raw.len(),end,raw[1]+1,&labels),
-            "indexed_tail" => Command::new("INLINE_DATA").text("purpose","indexed_jump_selectors"),
-            kind if kind.starts_with("case_") => Command::new("MARKER"),
-            kind if kind.starts_with("op_") && raw.len()>=2 && ARGC[raw[1] as usize]==-3 =>
-                semantic::condition(data,raw,row.at+raw.len(),end,&labels),
-            kind if kind.starts_with("op_") && raw.len()==3 && raw[1]==raw[2] && matches!(raw[1],0x21|0x2f|0x38|0x41|0x4a) =>
-                Command::new("MARKER"),
-            _ => semantic::unknown(),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()> {
@@ -474,7 +542,31 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
         "descriptor\tbody\tend_exclusive\tprovenance\tbytes\tchoice_menus\tfirst_text\tlisting\n",
     );
     let mut semantic_index = String::from("scene_id\tscene_file\tnative_scene\n");
-    let scene_ids = results.keys().enumerate().map(|(i,desc)|(*desc,semantic::scene_id("pp4",i+1))).collect::<BTreeMap<_,_>>();
+    let scene_ids = results
+        .keys()
+        .enumerate()
+        .map(|(i, desc)| (*desc, semantic::scene_id("pp4", i + 1)))
+        .collect::<BTreeMap<_, _>>();
+    let state_words = results
+        .iter()
+        .flat_map(|(desc, parsed)| {
+            parsed.rows.iter().filter_map(|row| {
+                let raw = &row.raw;
+                let index = if row.kind == "switch_u8" {
+                    raw.get(2).copied()
+                } else if row.kind.starts_with("op_")
+                    && raw.len() >= 4
+                    && ARGC[raw[1] as usize] == -3
+                {
+                    raw.get(3).copied()
+                } else {
+                    None
+                }?;
+                Some(word(data, *desc + 4 + 4 * index as usize))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let state_ids = semantic::state_ids("pp4", state_words);
     let mut edge_rows = String::from("source_desc\topcode_offset\tkind\ttarget_desc\texported\n");
     let mut root_rows = String::from("source\tdescriptor\n");
     let mut totals: BTreeMap<String, usize> = BTreeMap::new();
@@ -500,10 +592,14 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
             source = "layout_partial".into();
         }
         let relative = format!("events/{:02x}/{desc:06x}.txt", desc >> 16);
-        let scene_id=&scene_ids[desc];
-        let commands=semantic_commands(data,*desc,end,parsed,&scene_ids,&chars);
-        let scene_file=semantic::write_scene(semantic_out,"pp4",scene_id,&commands)?;
-        writeln!(semantic_index,"{scene_id}\t{scene_file}\tnative/{}",relative.replace(".txt",".yaml"))?;
+        let scene_id = &scene_ids[desc];
+        let commands = semantic_commands(data, *desc, end, parsed, &scene_ids, &state_ids, &chars);
+        let scene_file = semantic::write_scene(semantic_out, "pp4", scene_id, &commands)?;
+        writeln!(
+            semantic_index,
+            "{scene_id}\t{scene_file}\tnative/{}",
+            relative.replace(".txt", ".yaml")
+        )?;
         let mut listing = format!(
             "# AP4J descriptor=0x{desc:06X} body=0x{start:06X} end_exclusive=0x{end:06X}\n# provenance={source} padding={}\n# offset | original bytes | type | Japanese text / argument\n",
             hex(&data[end..*desc])
@@ -687,6 +783,7 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
         quote(&hex(&dig.finalize()))
     );
     write_file(&out.join("manifest.json"), &manifest)?;
-    write_file(&semantic_out.join("index.tsv"),&semantic_index)?;
+    write_file(&semantic_out.join("index.tsv"), &semantic_index)?;
+    semantic::write_state_index(semantic_out, &state_ids)?;
     Ok(())
 }

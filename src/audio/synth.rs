@@ -356,11 +356,12 @@ mod tests {
     #[test]
     fn rom_psg_periods_match_verified_driver_trace() {
         for (name, game) in [("pp4", Game::Pp4), ("pp6", Game::Pp6)] {
-            let path = format!("/Users/devonly/Developer/biccame-pocket/assets/roms/{name}.gba");
-            if !Path::new(&path).exists() {
+            let Some(path) = crate::test_assets::rom(name) else {
                 continue;
-            }
-            let rom = fs::read(path).unwrap();
+            };
+            let verified = crate::verify_rom(&path).unwrap();
+            assert_eq!(verified.game, game);
+            let rom = verified.bytes;
             assert_eq!(psg_period(&rom, game, 36 << 8).unwrap(), 0x706);
             assert_eq!(psg_period(&rom, game, (36 << 8) | 0x80).unwrap(), 0x70d);
             assert_eq!(noise_register(&rom, game, 31 << 8), 0x52);

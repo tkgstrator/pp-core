@@ -190,18 +190,16 @@ mod tests {
 
     #[test]
     fn verified_rom_uses_game_folder_for_selected_category() {
-        let source = Path::new("/Users/devonly/Developer/biccame-pocket/assets/roms/pp4.gba");
-        if !source.exists() {
-            eprintln!("skipping unavailable local ROM: {}", source.display());
+        let Some(source) = crate::test_assets::rom("pp4") else {
             return;
-        }
+        };
         let temp = tempfile::tempdir().unwrap();
         let out = temp.path().join("out");
         let called = Cell::new(false);
         execute(
             Cli {
                 command: Command::Extract {
-                    rom: source.to_path_buf(),
+                    rom: source,
                     out: out.clone(),
                     only: Only::Scripts,
                 },
@@ -222,17 +220,15 @@ mod tests {
 
     #[test]
     fn all_extracts_five_categories() {
-        let source = Path::new("/Users/devonly/Developer/biccame-pocket/assets/roms/pp6.gba");
-        if !source.exists() {
-            eprintln!("skipping unavailable local ROM: {}", source.display());
+        let Some(source) = crate::test_assets::rom("pp6") else {
             return;
-        }
+        };
         let temp = tempfile::tempdir().unwrap();
         let mut actual = Vec::new();
         execute(
             Cli {
                 command: Command::Extract {
-                    rom: source.to_path_buf(),
+                    rom: source,
                     out: temp.path().to_path_buf(),
                     only: Only::All,
                 },

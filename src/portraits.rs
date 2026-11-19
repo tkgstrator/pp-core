@@ -541,9 +541,6 @@ fn overlay(dst: &mut RgbaImage, src: &RgbaImage) {
 mod tests {
     use super::*;
 
-    const ROMS: &str = "/Users/devonly/Developer/biccame-pocket/assets/roms";
-    const ORACLE: &str = "/Users/devonly/Developer/biccame-pocket/assets/extracted";
-
     fn files(dir: &Path, sub: &str) -> Vec<String> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir.join(sub)).unwrap() {
@@ -591,25 +588,31 @@ mod tests {
 
     #[test]
     fn pp4_matches_python_oracle_when_available() {
-        let rom_path = Path::new(ROMS).join("pp4.gba");
-        let want = Path::new(ORACLE).join("pp4/portraits");
-        if !rom_path.exists() || !want.exists() {
+        let Some(rom_path) = crate::test_assets::rom("pp4") else {
             return;
-        }
+        };
+        let Some(want) = crate::test_assets::oracle("pp4", "portraits", "manifest.json") else {
+            return;
+        };
+        let rom = crate::verify_rom(&rom_path).unwrap();
+        assert_eq!(rom.game, Game::Pp4);
         let temp = tempfile::tempdir().unwrap();
-        extract(&std::fs::read(rom_path).unwrap(), temp.path(), Game::Pp4).unwrap();
+        extract(&rom.bytes, temp.path(), Game::Pp4).unwrap();
         compare("pp4", temp.path(), &want);
     }
 
     #[test]
     fn pp6_matches_python_oracle_when_available() {
-        let rom_path = Path::new(ROMS).join("pp6.gba");
-        let want = Path::new(ORACLE).join("pp6/portraits");
-        if !rom_path.exists() || !want.exists() {
+        let Some(rom_path) = crate::test_assets::rom("pp6") else {
             return;
-        }
+        };
+        let Some(want) = crate::test_assets::oracle("pp6", "portraits", "manifest.json") else {
+            return;
+        };
+        let rom = crate::verify_rom(&rom_path).unwrap();
+        assert_eq!(rom.game, Game::Pp6);
         let temp = tempfile::tempdir().unwrap();
-        extract(&std::fs::read(rom_path).unwrap(), temp.path(), Game::Pp6).unwrap();
+        extract(&rom.bytes, temp.path(), Game::Pp6).unwrap();
         compare("pp6", temp.path(), &want);
     }
 

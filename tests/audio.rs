@@ -4,22 +4,25 @@ use ppextractor::{
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::Path;
+
+#[allow(dead_code)]
+#[path = "../src/test_assets.rs"]
+mod test_assets;
 
 #[test]
 fn pp4_audio_exports_rom_banks_and_tracks() {
-    let rom_path = Path::new("/Users/devonly/Developer/biccame-pocket/assets/roms/pp4.gba");
-    if !rom_path.exists() {
+    let Some(rom_path) = test_assets::rom("pp4") else {
         return;
-    }
-    let rom = std::fs::read(rom_path).unwrap();
+    };
+    let rom = ppextractor::verify_rom(&rom_path).unwrap();
+    assert_eq!(rom.game, Game::Pp4);
     let tmp = tempfile::tempdir().unwrap();
     let options = AudioOptions {
         render_tracks: false,
         ..AudioOptions::default()
     };
     let root = tmp.path().join("pp4/audio");
-    extract_with_options(&rom, &root, Game::Pp4, &options).unwrap();
+    extract_with_options(&rom.bytes, &root, Game::Pp4, &options).unwrap();
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["counts"]["sample_wavs"], 155);
@@ -37,12 +40,14 @@ fn pp4_audio_exports_rom_banks_and_tracks() {
 #[test]
 fn selected_rom_audio_matches_reference_wave_and_midi() {
     for (name, game, song) in [("pp4", Game::Pp4, "040"), ("pp6", Game::Pp6, "07b")] {
-        let base = Path::new("/Users/devonly/Developer/biccame-pocket/assets");
-        let rom_path = base.join("roms").join(format!("{name}.gba"));
-        let reference = base.join("extracted").join(name).join("audio");
-        if !rom_path.exists() || !reference.exists() {
+        let Some(rom_path) = test_assets::rom(name) else {
             continue;
-        }
+        };
+        let Some(reference) = test_assets::oracle(name, "audio", "") else {
+            continue;
+        };
+        let rom = ppextractor::verify_rom(&rom_path).unwrap();
+        assert_eq!(rom.game, game);
         let tmp = tempfile::tempdir().unwrap();
         let output = tmp.path().join(name).join("audio");
         let selected_ids = BTreeSet::from([u32::from_str_radix(song, 16).unwrap()]);
@@ -50,7 +55,7 @@ fn selected_rom_audio_matches_reference_wave_and_midi() {
             selected_ids: Some(selected_ids),
             ..AudioOptions::default()
         };
-        extract_with_options(&std::fs::read(rom_path).unwrap(), &output, game, &options).unwrap();
+        extract_with_options(&rom.bytes, &output, game, &options).unwrap();
         let sample = if name == "pp4" { "6f101c" } else { "722da8" };
         for relative in [
             format!("native/samples/{sample}.bin"),
