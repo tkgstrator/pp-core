@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="ppextractor-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          exe=ppextractor
+          if [ "${{ matrix.archive }}" = "zip" ]; then exe=ppextractor.exe; fi
+          cp "target/${{ matrix.target }}/release/${exe}" "dist/${name}/"
+          cp README.md "dist/${name}/"
+          for f in LICENSE LICENSE-MIT LICENSE-APACHE LICENSE.md LICENSE.txt COPYING; do
+            if [ -f "$f" ]; then cp "$f" "dist/${name}/"; fi
+          done
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "${name}.zip" "${name}"
+            file="${name}.zip"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+            file="${name}.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$file" > "${file}.sha256"
+          else
+            shasum -a 256 "$file" > "${file}.sha256"
+          fi
+          echo "ASSET=${file}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/${{ env.ASSET }}
+            dist/${{ env.ASSET }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          cd artifacts
+          cat ./*.sha256 > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS.txt \
+            --verify-tag --generate-notes --title "${GITHUB_REF_NAME}" ${prerelease}

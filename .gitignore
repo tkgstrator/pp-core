@@ -1,0 +1,6 @@
+/target/
+*.gba
+*.agb
+*.bin
+/extracted/
+.DS_Store
