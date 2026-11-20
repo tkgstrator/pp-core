@@ -4,3 +4,4 @@
 *.bin
 /extracted/
 .DS_Store
+/web/pkg/

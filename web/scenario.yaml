@@ -1,0 +1,16 @@
+start_scene: after_practice
+max_turns: 144
+phases:
+  - 朝
+  - 昼
+  - 夜
+characters:
+  hazuki: 葉月
+stats:
+  trust:
+    initial: 48
+    min: 0
+    max: 100
+flags:
+  club_member: true
+  walked_to_station: false

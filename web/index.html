@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PP スクリプトプレイヤー</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>PP スクリプトプレイヤー</h1>
+      <button id="sound" type="button" aria-pressed="true">音声オン</button>
+    </header>
+
+    <div class="workspace">
+      <aside class="flow-panel" aria-labelledby="flow-title">
+        <h2 id="flow-title" class="panel-heading">シナリオフロー</h2>
+        <div id="flow-scroll" tabindex="0" aria-label="シーンと分岐の一覧">
+          <p id="flow-empty">シナリオを読み込むと、ここに全分岐が表示されます。</p>
+          <ol id="flow"></ol>
+        </div>
+      </aside>
+
+      <div class="player-panel">
+        <div id="scene-id" class="panel-heading">SCENE —</div>
+        <section id="stage" aria-label="シーン">
+          <img id="background" alt="" hidden>
+          <div id="portraits" aria-hidden="true">
+            <div class="portrait" id="left" hidden></div>
+            <div class="portrait" id="right" hidden></div>
+          </div>
+          <div class="dialogue">
+            <p id="speaker" hidden></p>
+            <p id="line" aria-live="polite">名前を入力して、会話を始めてください。</p>
+            <div id="choices"></div>
+            <button id="next" type="button" hidden>次へ <span aria-hidden="true">→</span></button>
+          </div>
+        </section>
+
+        <form id="setup">
+          <label>プレイヤー名 <input id="player" value="あおい" required maxlength="40"></label>
+          <button id="start" type="submit" disabled>会話を始める</button>
+        </form>
+      </div>
+
+      <aside class="state-panel" aria-labelledby="state-title">
+        <h2 id="state-title" class="panel-heading">STATE</h2>
+        <div id="state-scroll" tabindex="0" aria-label="現在の状態と変更履歴">
+          <p id="state-empty">再生すると状態が表示されます。</p>
+          <div id="state-content" hidden>
+            <section class="state-group" aria-labelledby="state-stats-title">
+              <h3 id="state-stats-title">パラメータ</h3>
+              <dl id="state-stats"></dl>
+            </section>
+            <section class="state-group" aria-labelledby="state-flags-title">
+              <h3 id="state-flags-title">フラグ</h3>
+              <dl id="state-flags"></dl>
+            </section>
+            <section class="state-group" aria-labelledby="state-session-title">
+              <h3 id="state-session-title">再生状態</h3>
+              <dl id="state-session"></dl>
+            </section>
+            <section class="state-group" aria-labelledby="state-history-title">
+              <h3 id="state-history-title">パラメータ・フラグの変更履歴</h3>
+              <p id="state-history-empty">変更なし</p>
+              <ol id="state-history" aria-live="polite" aria-relevant="additions"></ol>
+            </section>
+          </div>
+        </div>
+      </aside>
+    </div>
+    <p id="error" role="alert" hidden></p>
+    <details>
+      <summary>自分のシナリオを読み込む</summary>
+      <div class="files">
+        <label>スクリプト YAML <input id="script" type="file" accept=".yaml,.yml"></label>
+        <label>シナリオ設定（scenario.yaml） <input id="scenario" type="file" accept=".yaml,.yml"></label>
+        <label>画像・音声素材 <input id="assets" type="file" accept="image/*,audio/*" multiple></label>
+      </div>
+    </details>
+  </main>
+  <script type="module" src="./player.js"></script>
+</body>
+</html>
