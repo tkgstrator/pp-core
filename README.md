@@ -2,6 +2,11 @@
 
 Rust command-line extractor for the Japanese Game Boy Advance releases of Power Pro Kun Pocket 4 and 6. The ROM stays on your machine. The program checks its game code, revision, and exact SHA-256 before creating any output.
 
+## Workspace
+
+- [`crates/pp-extract`](crates/pp-extract) contains the ROM extractor and builds the `ppextractor` command.
+- [`crates/pp-core`](crates/pp-core) contains the script engine and WASM bindings.
+
 ## Supported ROMs
 
 | Game | GBA game code | Revision | SHA-256 |
@@ -18,7 +23,7 @@ Replace `<PATH_TO_ROM>` with the path to a supported PP4 or PP6 ROM and `<PATH_T
 From the repository root, with Rust and Cargo installed:
 
 ```sh
-cargo build --release --locked -p ppextractor
+cargo build --release --locked -p pp-extract
 ./target/release/ppextractor supported
 ./target/release/ppextractor extract "<PATH_TO_ROM>" --out "<PATH_TO_OUTPUT>"
 ```
@@ -116,7 +121,7 @@ sha256sum --check --ignore-missing SHA256SUMS.txt   # macOS: shasum -a 256 -c --
 
 Releases never include ROMs or extracted assets; supply your own ROM.
 
-To cut a release, set `version` in `Cargo.toml`, commit it, then push a matching tag. The workflow refuses tags that do not match the Cargo version, and tags with a suffix (e.g. `v0.2.0-rc.1`) are published as pre-releases:
+To cut a release, set `version` in `crates/pp-extract/Cargo.toml`, commit it, then push a matching tag. The workflow refuses tags that do not match the Cargo version, and tags with a suffix (e.g. `v0.2.0-rc.1`) are published as pre-releases:
 
 ```sh
 git tag "<RELEASE_TAG>"

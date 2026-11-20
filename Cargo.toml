@@ -1,22 +1,3 @@
-[package]
-name = "ppextractor"
-version = "0.1.0"
-edition = "2024"
-description = "Extract assets from verified Japanese Power Pro Kun Pocket 4 and 6 GBA ROMs"
-
-[dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
-hound = "3"
-
-[dev-dependencies]
-tempfile = "3"
-
 [workspace]
-members = ["crates/pp-core"]
-default-members = [".", "crates/pp-core"]
+members = ["crates/pp-core", "crates/pp-extract"]
 resolver = "3"
