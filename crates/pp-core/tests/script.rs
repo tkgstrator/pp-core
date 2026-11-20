@@ -2,7 +2,8 @@ use pp_core::script::{Bgm, Command, Script};
 
 #[test]
 fn reads_the_complete_documented_scenario() {
-    let yaml = include_str!("../../../docs/pp-core/scripts/format.md")
+    let yaml = include_str!("../../../docs/pp-core/scripts/format.md").replace("\r\n", "\n");
+    let yaml = yaml
         .split_once("```yaml\n")
         .unwrap()
         .1

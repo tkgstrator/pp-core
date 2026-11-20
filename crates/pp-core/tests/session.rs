@@ -3,7 +3,8 @@ use pp_core::session::{Event, Pause, Scenario, Session};
 
 #[test]
 fn plays_the_documented_scenario_through_choice_wait_and_scene_change() {
-    let source = include_str!("../../../docs/pp-core/scripts/format.md")
+    let source = include_str!("../../../docs/pp-core/scripts/format.md").replace("\r\n", "\n");
+    let source = source
         .split_once("```yaml\n")
         .unwrap()
         .1
