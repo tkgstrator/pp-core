@@ -14,8 +14,8 @@ Rust command-line extractor for the Japanese Game Boy Advance releases of Power 
 ```sh
 cargo build --release
 ./target/release/ppextractor supported
-./target/release/ppextractor extract /path/to/pp4.gba --out ./extracted
-./target/release/ppextractor extract /path/to/pp6.gba --out ./extracted --only scripts
+./target/release/ppextractor extract "<PATH_TO_ROM>" --out ./extracted
+./target/release/ppextractor extract "<PATH_TO_ROM>" --out ./extracted --only scripts
 ```
 
 `--only` accepts `all` (the default), `images`, `fonts`, `scripts`, `portraits`, or `audio`. A modified ROM or unsupported revision is rejected, and nothing is written for it.
@@ -45,7 +45,7 @@ See the [extended PP script format](docs/pp-core/scripts/format.md) for the YAML
 The public CI runs ROM-free tests, format and Clippy checks, and a smoke test of each release binary. To require full parity tests locally, provide an assets directory containing `roms/pp4.gba`, `roms/pp6.gba`, and the reference outputs under `extracted/pp4/` and `extracted/pp6/`:
 
 ```sh
-PPEXTRACTOR_ASSETS_ROOT=/path/to/assets PPEXTRACTOR_REQUIRE_ROM_PARITY=1 cargo test --all-targets --locked
+PPEXTRACTOR_ASSETS_ROOT="<PATH_TO_ASSETS>" PPEXTRACTOR_REQUIRE_ROM_PARITY=1 cargo test --all-targets --locked
 ```
 
 This mode fails if a ROM or reference output is missing. ROMs and reference outputs are not committed or packaged.
