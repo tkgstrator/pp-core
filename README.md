@@ -38,6 +38,8 @@ The output root contains a `4` (PP4) or `6` (PP6) folder with this layout:
 
 `scripts/index.tsv` links scene IDs to their YAML files. The original lossless ROM records, including raw bytes and offsets, are kept separately in `scripts/native/`; `scripts/state-links.tsv` records the source of opaque state IDs. `SE`, `BGM`, and `RETURN` are reserved command types until their dialogue opcode mappings are verified. `UNRESOLVED` marks instructions whose effects are still unknown, so these scenes are not yet a complete playable reconstruction. See [the script format](docs/script-format.md) for the command fields and limits.
 
+See the [extended PP script format](docs/pp-core/scripts/format.md) for the YAML specification for `pp-core` playback.
+
 ## Verification
 
 The public CI runs ROM-free tests, format and Clippy checks, and a smoke test of each release binary. To require full parity tests locally, provide an assets directory containing `roms/pp4.gba`, `roms/pp6.gba`, and the reference outputs under `extracted/pp4/` and `extracted/pp6/`:
@@ -68,3 +70,15 @@ git push origin v0.1.0
 CI (`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`) runs on every push and pull request.
 
 This program runs entirely in Rust; Python and the source project's assets are not runtime dependencies. Keep ROM files outside Git repositories.
+
+## Extended PP player
+
+Build the WASM package, then serve the repository root:
+
+```sh
+rustup target add wasm32-unknown-unknown
+wasm-pack build crates/pp-core --target web --release --out-dir ../../web/pkg -- --features wasm --locked
+python3 -m http.server 8000 --bind 127.0.0.1
+```
+
+Open [the local player](http://127.0.0.1:8000/web/) to play the documented scenario. To load your own script YAML, also provide its [required scenario configuration](web/scenario.yaml). You can optionally upload image or audio files. Use the asset ID as each filename stem (for example, `school_gate_evening.png` or `thunder.wav`). Set `start_scene` in the configuration to a scene in the uploaded script. The built-in demo uses placeholder portraits and synthesized audio. The browser implements the `shake` effect.

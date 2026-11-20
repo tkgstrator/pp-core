@@ -15,3 +15,8 @@ hound = "3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[workspace]
+members = ["crates/pp-core"]
+default-members = [".", "crates/pp-core"]
+resolver = "3"
