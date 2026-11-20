@@ -11,11 +11,38 @@ Rust command-line extractor for the Japanese Game Boy Advance releases of Power 
 
 ## Usage
 
+Replace `<PATH_TO_ROM>` with the path to a supported PP4 or PP6 ROM. Keep the quotes if the path contains spaces.
+
+### Build from source
+
+From the repository root, with Rust and Cargo installed:
+
 ```sh
-cargo build --release
+cargo build --release --locked -p ppextractor
 ./target/release/ppextractor supported
 ./target/release/ppextractor extract "<PATH_TO_ROM>" --out ./extracted
-./target/release/ppextractor extract "<PATH_TO_ROM>" --out ./extracted --only scripts
+```
+
+On Windows, run `.\target\release\ppextractor.exe` from PowerShell.
+
+### Use a release binary
+
+Download the archive for your platform from [GitHub Releases](https://github.com/tkgstrator/pp-core/releases). Extract it, then open a terminal in the extracted folder. Release archives are built for Linux x86-64, macOS Apple Silicon and Intel, and Windows x86-64.
+
+Linux and macOS:
+
+```sh
+./ppextractor supported
+./ppextractor extract "<PATH_TO_ROM>" --out ./extracted
+./ppextractor extract "<PATH_TO_ROM>" --out ./extracted --only scripts
+```
+
+Windows (PowerShell):
+
+```powershell
+.\ppextractor.exe supported
+.\ppextractor.exe extract "<PATH_TO_ROM>" --out .\extracted
+.\ppextractor.exe extract "<PATH_TO_ROM>" --out .\extracted --only scripts
 ```
 
 `--only` accepts `all` (the default), `images`, `fonts`, `scripts`, `portraits`, or `audio`. A modified ROM or unsupported revision is rejected, and nothing is written for it.
