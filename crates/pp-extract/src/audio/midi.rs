@@ -1,6 +1,6 @@
 use super::{
     DRIVER_UPDATE_HZ, Kind,
-    sequence::{Decoded, StopReason},
+    sequence::{Decoded, Event, StopReason},
 };
 use anyhow::{Result, ensure};
 use std::fs;
@@ -11,6 +11,30 @@ pub(super) struct MidiInfo {
     pub tracks: usize,
     pub sha256: String,
 }
+fn bend_displacement(event: &Event, kind: Kind) -> f64 {
+    let offset = match kind {
+        Kind::Wave => 24.0,
+        Kind::Square => 36.0,
+        _ => 0.0,
+    };
+    event.pitch_fixed as i16 as f64 / 256.0 + offset - f64::from(event.pitch)
+}
+
+fn bend_range(track: &Decoded, kind: Kind) -> Result<u8> {
+    let mut range = 12.0_f64;
+    if !matches!(kind, Kind::Noise | Kind::Control) {
+        for event in track.events.iter().filter(|event| event.note) {
+            let displacement = bend_displacement(event, kind);
+            // MIDI bend has an inclusive negative edge and an exclusive positive edge.
+            range = range
+                .max((-displacement).ceil())
+                .max(displacement.floor() + 1.0);
+        }
+    }
+    ensure!(range <= 127.0, "Native pitch outside MIDI bend range");
+    Ok(range as u8)
+}
+
 fn vlq(mut value: u64) -> Vec<u8> {
     let mut bytes = vec![(value & 127) as u8];
     value >>= 7;
@@ -20,13 +44,17 @@ fn vlq(mut value: u64) -> Vec<u8> {
     }
     bytes
 }
-fn meta(kind: u8, value: &[u8]) -> Vec<u8> {
+pub(crate) fn meta(kind: u8, value: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0xff, kind];
     bytes.extend(vlq(value.len() as u64));
     bytes.extend(value);
     bytes
 }
-fn track(mut events: Vec<(u64, i32, Vec<u8>)>) -> Vec<u8> {
+fn track(events: Vec<(u64, i32, Vec<u8>)>) -> Vec<u8> {
+    track_until(events, 0)
+}
+
+pub(crate) fn track_until(mut events: Vec<(u64, i32, Vec<u8>)>, end_tick: u64) -> Vec<u8> {
     events.sort_by_key(|e| (e.0, e.1));
     let mut body = Vec::new();
     let mut previous = 0u64;
@@ -35,7 +63,8 @@ fn track(mut events: Vec<(u64, i32, Vec<u8>)>) -> Vec<u8> {
         body.extend(data);
         previous = tick;
     }
-    body.extend([0, 0xff, 0x2f, 0]);
+    body.extend(vlq(end_tick.saturating_sub(previous)));
+    body.extend([0xff, 0x2f, 0]);
     let mut result = b"MTrk".to_vec();
     result.extend((body.len() as u32).to_be_bytes());
     result.extend(body);
@@ -55,14 +84,34 @@ pub(super) fn write_midi(
         channels.len() <= 15 && channels.len() == kinds.len(),
         "Invalid MIDI channel count"
     );
-    let mut tracks = vec![track(vec![
+    let mut conductor = vec![
         (0, 0, meta(3, title.as_bytes())),
         (0, 1, meta(0x51, &1_000_000u32.to_be_bytes()[1..])),
         (0, 2, meta(1, b"ROM timbres via companion SoundFont")),
-    ])];
+    ];
+    // One song-wide loop for players (loopStart/loopEnd markers): every
+    // looping channel repeats with the same period, but PCM and PSG channels
+    // may enter their loop a few frames apart, so take the most common
+    // period and the earliest start among the channels that use it.
+    let loops: Vec<(usize, usize)> = channels
+        .iter()
+        .filter(|d| d.stop_reason == StopReason::Loop)
+        .filter_map(|d| d.loop_frame.map(|start| (start, d.end_frame - start)))
+        .collect();
+    let period = loops
+        .iter()
+        .map(|&(_, p)| p)
+        .max_by_key(|&p| loops.iter().filter(|&&(_, q)| q == p).count());
+    if let Some(period) = period {
+        let start = loops.iter().filter(|&&(_, p)| p == period).map(|&(s, _)| s).min().unwrap_or(0);
+        conductor.push((tick(start), 3, meta(0x06, b"loopStart")));
+        conductor.push((tick(start + period), 4, meta(0x06, b"loopEnd")));
+    }
+    let mut tracks = vec![track(conductor)];
     let mut total_notes = 0;
     for (index, (decoded, &kind)) in channels.iter().zip(kinds).enumerate() {
         let percussion = kind == Kind::Control;
+        let bend_range = bend_range(decoded, kind)?;
         let midi_channel = if percussion {
             9
         } else if index < 9 {
@@ -77,10 +126,16 @@ pub(super) fn write_midi(
         };
         let mut stream = vec![(0, 0, meta(3, name.as_bytes()))];
         if !percussion {
-            for (i, (controller, value)) in
-                [(101, 0), (100, 0), (6, 12), (38, 0), (101, 127), (100, 127)]
-                    .iter()
-                    .enumerate()
+            for (i, (controller, value)) in [
+                (101, 0),
+                (100, 0),
+                (6, bend_range),
+                (38, 0),
+                (101, 127),
+                (100, 127),
+            ]
+            .iter()
+            .enumerate()
             {
                 stream.push((
                     0,
@@ -125,19 +180,10 @@ pub(super) fn write_midi(
                 preset = Some(new_preset);
             }
             if !percussion && kind != Kind::Noise {
-                let fixed = event.pitch_fixed as i16 as f64;
-                let offset = match kind {
-                    Kind::Wave => 24.0,
-                    Kind::Square => 36.0,
-                    _ => 0.0,
-                };
-                let displacement = fixed / 256.0 + offset - event.pitch as f64;
-                ensure!(
-                    (-12.0..12.0).contains(&displacement),
-                    "Native pitch outside MIDI bend range"
-                );
-                let value = (8192.0 + (displacement * 8192.0 / 12.0).round_ties_even())
-                    .clamp(0.0, 16383.0) as u16;
+                let displacement = bend_displacement(event, kind);
+                let value = (8192.0
+                    + (displacement * 8192.0 / f64::from(bend_range)).round_ties_even())
+                .clamp(0.0, 16383.0) as u16;
                 if bend != Some(value) {
                     stream.push((
                         at,
@@ -159,7 +205,7 @@ pub(super) fn write_midi(
             total_notes += 1;
         }
         match decoded.stop_reason {
-            StopReason::Loop => stream.push((tick(decoded.end_frame), 3, meta(0x06, b"LOOP"))),
+            StopReason::Loop => stream.push((tick(decoded.end_frame), 3, meta(0x01, b"LOOP"))),
             StopReason::DurationCap => {
                 stream.push((tick(decoded.end_frame), 3, meta(0x01, b"TRUNCATED")))
             }

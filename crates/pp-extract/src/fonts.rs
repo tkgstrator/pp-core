@@ -13,6 +13,13 @@ use std::path::Path;
 
 use crate::Game;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FontFormat {
+    Pp4,
+    Pp5,
+    Pp6,
+}
+
 const ROM_BASE: usize = 0x0800_0000;
 const PP4_TABLE: usize = 0x50d218;
 const PP6_TABLE: usize = 0x554a80;
@@ -59,9 +66,9 @@ fn supported(index: usize) -> Result<(usize, usize)> {
     Ok((page, slot))
 }
 
-fn pp4_pixels(rom: &[u8], index: usize) -> Result<Vec<Vec<u8>>> {
+fn pp4_pixels(rom: &[u8], table: usize, index: usize) -> Result<Vec<Vec<u8>>> {
     let (page, slot) = supported(index)?;
-    let start = source(rom, PP4_TABLE, page)? + ((slot & 0x38) << 7) + ((slot & 7) << 6);
+    let start = source(rom, table, page)? + ((slot & 0x38) << 7) + ((slot & 7) << 6);
     let mut rows = vec![vec![0; 16]; 16];
     for (y, row) in rows.iter_mut().enumerate() {
         for (x, pixel) in row.iter_mut().enumerate() {
@@ -75,16 +82,19 @@ fn pp4_pixels(rom: &[u8], index: usize) -> Result<Vec<Vec<u8>>> {
     Ok(rows)
 }
 
-fn pp6_pixels(rom: &[u8], index: usize) -> Result<Vec<Vec<u8>>> {
+fn compact_pixels(
+    rom: &[u8],
+    table: usize,
+    index: usize,
+    format: FontFormat,
+) -> Result<Vec<Vec<u8>>> {
     let (page, slot) = supported(index)?;
-    let source = source(rom, PP6_TABLE, page)?;
-    let base = source
-        + if slot & 8 != 0 {
-            200 + (slot & 0x30) * 36
-        } else {
-            (slot & 0x38) * 36
-        }
-        + (slot & 4) * 24
+    let source = source(rom, table, page)?;
+    let base = if slot & 8 != 0 {
+        200 + (slot & 0x30) * 36
+    } else {
+        (slot & 0x38) * 36
+    } + (slot & 4) * 24
         + [0, 17, 48, 65][slot & 3];
     let offsets = [0, if slot & 1 != 0 { 15 } else { 1 }, 16];
     let width = if page >= 64 { 8 } else { 12 };
@@ -97,14 +107,60 @@ fn pp6_pixels(rom: &[u8], index: usize) -> Result<Vec<Vec<u8>>> {
             (if slot & 8 != 0 { 0xb8 } else { 0xc0 }) + 2 * (y - split)
         };
         for (x, pixel) in row.iter_mut().enumerate() {
-            let at = base + offsets[x / 4] + step;
+            let group = base + offsets[x / 4] + step;
+            let (at, shift, mask) = if format == FontFormat::Pp5 {
+                (source + group * 2 + (x % 4) / 2, 4 * (x % 2), 15)
+            } else {
+                (source + group, 2 * (x % 4), 3)
+            };
             let byte = rom
                 .get(at)
-                .with_context(|| format!("PP6 glyph {index:#x} outside ROM"))?;
-            *pixel = (byte >> (2 * (x % 4))) & 3;
+                .with_context(|| format!("Glyph {index:#x} outside ROM"))?;
+            *pixel = (byte >> shift) & mask;
         }
     }
     Ok(rows)
+}
+
+pub(crate) fn discover_tables(rom: &[u8]) -> Vec<(FontFormat, usize)> {
+    const SLOTS: usize = 67;
+    const FORMATS: [(FontFormat, usize); 3] = [
+        (FontFormat::Pp4, 0x2000),
+        (FontFormat::Pp5, 0x1200),
+        (FontFormat::Pp6, 0x0900),
+    ];
+    let mut tables = Vec::new();
+    for (word_index, table) in rom.windows(4 * SLOTS).step_by(4).enumerate() {
+        let read = |page| word(table, page * 4).unwrap();
+        let first = read(0);
+        let Some(start) = first.checked_sub(ROM_BASE) else {
+            continue;
+        };
+        let Some((format, stride)) = FORMATS
+            .into_iter()
+            .find(|&(_, stride)| first.checked_add(stride) == Some(read(1)))
+        else {
+            continue;
+        };
+        if start.saturating_add(58 * stride) > rom.len()
+            || (55..64).any(|page| read(page) != first)
+            || (2..55).any(|page| read(page) != first + page * stride)
+            || (64..67).any(|page| read(page) != first + (page - 9) * stride)
+        {
+            continue;
+        }
+        let offset = word_index * 4;
+        if format == FontFormat::Pp6
+            && (0..55 * 64).chain(64 * 64..67 * 64).any(|glyph| {
+                !compact_pixels(rom, offset, glyph, format)
+                    .is_ok_and(|pixels| pixels.iter().flatten().all(|&ink| ink < 3))
+            })
+        {
+            continue;
+        }
+        tables.push((format, offset));
+    }
+    tables
 }
 
 fn mappings(game: Game) -> BTreeMap<char, i32> {
@@ -196,11 +252,42 @@ fn rgba(game: Game, ink: u8) -> Result<Rgba<u8>> {
 /// Write `glyphs.png`, `glyphs.json`, and the CFF `dialogue.otf` into `out`.
 pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
     let digest = format!("{:x}", Sha256::digest(rom));
+    let pp4_v0 = game == Game::Pp4 && digest == crate::rom::PP4_V0_SHA256;
     ensure!(
-        digest == game.expected_sha256(),
+        game.accepts_sha256(&digest),
         "Expected verified Japanese {} ROM",
         game.code()
     );
+    let table = match game {
+        Game::Pp4 if pp4_v0 => 0x50ca4c,
+        Game::Pp4 => PP4_TABLE,
+        Game::Pp6 => PP6_TABLE,
+    };
+    let format = match game {
+        Game::Pp4 => FontFormat::Pp4,
+        Game::Pp6 => FontFormat::Pp6,
+    };
+    export(rom, out, game.id(), format, table)
+}
+
+pub(crate) fn export(
+    rom: &[u8],
+    out: &Path,
+    id: &str,
+    format: FontFormat,
+    table: usize,
+) -> Result<()> {
+    let game = match format {
+        FontFormat::Pp4 => Game::Pp4,
+        FontFormat::Pp5 | FontFormat::Pp6 => Game::Pp6,
+    };
+    // The 4-bit layouts include diagnostic palette indices in non-text cells.
+    let ink_game = if format == FontFormat::Pp5 {
+        Game::Pp4
+    } else {
+        game
+    };
+    let inherited = id != game.id();
     std::fs::create_dir_all(out)?;
     let mapping = mappings(game);
     let mut by_index: BTreeMap<i32, Vec<char>> = BTreeMap::new();
@@ -213,13 +300,13 @@ pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
     let mut outlines = BTreeMap::new();
     for (slot, index) in (0..55 * 64).chain(64 * 64..67 * 64).enumerate() {
         let pixels = match game {
-            Game::Pp4 => pp4_pixels(rom, index)?,
-            Game::Pp6 => pp6_pixels(rom, index)?,
+            Game::Pp4 => pp4_pixels(rom, table, index)?,
+            Game::Pp6 => compact_pixels(rom, table, index, format)?,
         };
         let (x0, y0) = ((slot % 64) * cell, (slot / 64) * cell);
         for (y, row) in pixels.iter().enumerate() {
             for (x, &ink) in row.iter().enumerate() {
-                atlas.put_pixel((x0 + x) as u32, (y0 + y) as u32, rgba(game, ink)?);
+                atlas.put_pixel((x0 + x) as u32, (y0 + y) as u32, rgba(ink_game, ink)?);
             }
         }
         if by_index.contains_key(&(index as i32)) {
@@ -229,7 +316,13 @@ pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
                     .iter()
                     .map(|row| {
                         row.iter()
-                            .map(|&v| if game == Game::Pp4 { v == 2 } else { v != 0 })
+                            .map(|&v| {
+                                if ink_game == Game::Pp4 {
+                                    v == 2
+                                } else {
+                                    v != 0
+                                }
+                            })
                             .collect()
                     })
                     .collect(),
@@ -246,6 +339,8 @@ pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
             .unwrap_or_default();
         let confidence = if unicode.is_empty() {
             "unmapped"
+        } else if inherited {
+            "inherited_assumption"
         } else if game == Game::Pp4 {
             "pp4_research"
         } else if PP6_VERIFIED.contains(&index) {
@@ -265,17 +360,19 @@ pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
     crate::gba::save_png(&atlas, &out.join("glyphs.png"))?;
     let mapped_indices = slots.iter().filter(|s| !s.unicode.is_empty()).count();
     let manifest = json!({
-        "game": game.id(),
+        "game": id,
         "bitmap": "glyphs.png",
         "cell_size": [cell, cell],
-        "ink_value_to_rgba": palette(game),
-        "otf_ink_values": if game == Game::Pp4 { vec![2] } else { vec![1, 2] },
+        "ink_value_to_rgba": palette(ink_game),
+        "otf_ink_values": if ink_game == Game::Pp4 { vec![2] } else { vec![1, 2] },
         "slots": slots.len(),
         "mapped_indices": mapped_indices,
         "mappings": mapping.len(),
         "virtual_glyphs": { "U+0020": { "advance_px": 4 }, "U+3000": { "advance_px": 12 } },
         "fallback_pages_omitted": (55..64).collect::<Vec<_>>(),
-        "mapping_note": if game == Game::Pp4 {
+        "mapping_note": if inherited {
+            "Unicode assignments are inherited from the matching font format and have not been verified for this title."
+        } else if game == Game::Pp4 {
             "PP4 uses the researched Unicode table and script narrow/extra assignments."
         } else {
             "PP6 uses PP4 Unicode assignments as assumptions except sample_verified indices; unmapped slots have no Unicode assignment."
@@ -970,4 +1067,27 @@ fn build_ttf(
     tables.insert(*b"name", name_table(&family));
     tables.insert(*b"post", post);
     Ok(sfnt(tables, [0, 1, 0, 0]))
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use crate::rom::{PROFILES, verify_supported_rom};
+
+    #[test]
+    fn discovers_dialogue_font_tables_on_all_local_gba_profiles() {
+        for profile in PROFILES {
+            let Some(path) = crate::test_assets::rom(profile.id) else {
+                continue;
+            };
+            let (_, rom) = verify_supported_rom(&path).unwrap();
+            let expected = profile.font.unwrap_or_else(|| match profile.id {
+                "pp4_v0" => (FontFormat::Pp4, 0x50ca4c),
+                "pp4" => (FontFormat::Pp4, PP4_TABLE),
+                "pp6" | "pp6_v0_clean" => (FontFormat::Pp6, PP6_TABLE),
+                other => panic!("{other} needs a known font table for the comparison"),
+            });
+            assert_eq!(discover_tables(&rom), [expected], "{}", profile.id);
+        }
+    }
 }

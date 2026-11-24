@@ -1,6 +1,6 @@
 //! Direct-ROM reference synthesis. ROM pitch tables drive every oscillator.
 use super::{
-    DRIVER_UPDATE_HZ, Game, Kind, Sample, le16, le32,
+    DRIVER_UPDATE_HZ, Kind, Playback, Sample, le16, le32,
     sequence::{Decoded, Event},
     sha,
 };
@@ -24,54 +24,43 @@ pub(super) struct WavOutput<'a> {
     pub rate: u32,
     pub stereo: bool,
 }
-fn wave_base(game: Game) -> usize {
-    match game {
-        Game::Pp4 => 0x0ced9c,
-        Game::Pp6 => 0x0fbd34,
-    }
-}
-fn period_tables(game: Game) -> (usize, usize) {
-    match game {
-        Game::Pp4 => (0x0ceb1c, 0x0cec1c),
-        Game::Pp6 => (0x0fbab4, 0x0fbbb4),
-    }
-}
-fn noise_table(game: Game) -> usize {
-    match game {
-        Game::Pp4 => 0x0cec9c,
-        Game::Pp6 => 0x0fbc34,
-    }
-}
-fn pcm_tables(game: Game) -> (usize, usize) {
-    match game {
-        Game::Pp4 => (0x50cbd8, 0x50cc8c),
-        Game::Pp6 => (0x554408, 0x5544bc),
-    }
-}
-fn transpose_table(game: Game) -> (usize, usize) {
-    match game {
-        Game::Pp4 => (0x5139a8, 45),
-        Game::Pp6 => (0x55e2a8, 56),
-    }
-}
-pub(super) fn transpose(rom: &[u8], game: Game, bank: usize, local: usize) -> Result<i32> {
+pub(super) fn transpose(rom: &[u8], playback: Playback, bank: usize, local: usize) -> Result<i32> {
     if bank != 0 {
         return Ok(0);
     }
-    let (base, count) = transpose_table(game);
+    let (base, count) = (playback.transpose, playback.sample_bases[1]);
     ensure!(local < count, "PCM bank-0 index out of range: {local}");
     Ok(le16(rom, base + local * 2)? as i16 as i32)
 }
-pub(super) fn pcm_rate(rom: &[u8], game: Game, s: &Sample, pitch_fixed: i32) -> Result<u32> {
-    let (lookup, mantissas) = pcm_tables(game);
+#[derive(Debug)]
+pub(super) struct PcmPitchOutsideTable(i32);
+
+impl std::fmt::Display for PcmPitchOutsideTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PCM pitch outside ROM rate table: {:#x}", self.0)
+    }
+}
+
+impl std::error::Error for PcmPitchOutsideTable {}
+
+pub(super) fn pcm_rate(
+    rom: &[u8],
+    playback: Playback,
+    s: &Sample,
+    pitch_fixed: i32,
+) -> Result<u32> {
+    let (lookup, mantissas) = (playback.pcm_rates, playback.pcm_rates + 0xb4);
     let signed = pitch_fixed as u16 as i16 as i32;
     let adjusted = signed + 0x1800;
-    let semitone = adjusted >> 8;
+    let mut semitone = adjusted >> 8;
     let fraction = adjusted & 255;
-    ensure!(
-        (0..127).contains(&semitone),
-        "PCM pitch outside ROM rate table: {pitch_fixed:#x}"
-    );
+    if playback.id == "pp7" {
+        // The PP7 track pitch update at 0x17bfc adds 0x1800 and
+        // masks the integer pitch to seven bits before the rate lookup.
+        semitone &= 0x7f;
+    } else if !(0..127).contains(&semitone) {
+        return Err(PcmPitchOutsideTable(pitch_fixed).into());
+    }
     let ratio = |i: usize| -> Result<u64> {
         let packed = *rom.get(lookup + i).context("PCM ratio table outside ROM")?;
         let mantissa = le32(rom, mantissas + (packed as usize & 15) * 4)? as u64;
@@ -83,15 +72,15 @@ pub(super) fn pcm_rate(rom: &[u8], game: Game, s: &Sample, pitch_fixed: i32) -> 
         (low as i64 + ((high as i64 - low as i64) * fraction as i64).div_euclid(256)) as u64;
     Ok(((s.pitch_q10 as u64 * interpolated) >> 32) as u32)
 }
-pub(super) fn psg_period(rom: &[u8], game: Game, pitch_fixed: u16) -> Result<u16> {
-    let (base, frac) = period_tables(game);
+pub(super) fn psg_period(rom: &[u8], playback: Playback, pitch_fixed: u16) -> Result<u16> {
+    let (base, frac) = (playback.psg_periods, playback.psg_periods + 0x100);
     let index = ((pitch_fixed >> 8) & 127) as usize;
     let integer = le16(rom, base + index * 2)?;
     let correction = (rom[frac + index] as u16 * (pitch_fixed & 255)) >> 8;
     Ok((integer + correction) & 0x7ff)
 }
-pub(super) fn noise_register(rom: &[u8], game: Game, pitch_fixed: u16) -> u8 {
-    rom[noise_table(game) + ((pitch_fixed >> 8) & 127) as usize]
+pub(super) fn noise_register(rom: &[u8], playback: Playback, pitch_fixed: u16) -> u8 {
+    rom[(playback.psg_periods + 0x180) + ((pitch_fixed >> 8) & 127) as usize]
 }
 pub(super) fn noise_cycle(narrow: bool) -> Vec<f32> {
     let mut state = 0x7fffu16;
@@ -111,7 +100,7 @@ fn sample_position(frame: usize, sample_rate: u32, update_rate: f64) -> usize {
 }
 pub(super) fn render_pcm(
     rom: &[u8],
-    game: Game,
+    playback: Playback,
     channels: &[Decoded],
     kinds: &[Kind],
     samples: &[Sample],
@@ -183,19 +172,19 @@ pub(super) fn render_pcm(
                 source = Some(data.iter().map(|b| (*b as i8 as f32) / 128.0).collect());
                 play_rate = pcm_rate(
                     rom,
-                    game,
+                    playback,
                     s,
                     note.pitch_fixed as i32
-                        + transpose(rom, game, note.sample_bank, note.sample_local)?,
+                        + transpose(rom, playback, note.sample_bank, note.sample_local)?,
                 )?;
             }
             let period = if kind == Kind::Square || kind == Kind::Wave {
-                psg_period(rom, game, note.pitch_fixed)?
+                psg_period(rom, playback, note.pitch_fixed)?
             } else {
                 0
             };
             let wave = if kind == Kind::Wave {
-                let base = wave_base(game) + note.wave_index as usize * 16;
+                let base = (playback.psg_periods + 0x280) + note.wave_index as usize * 16;
                 let bytes = rom.get(base..base + 16).context("Wave slot outside ROM")?;
                 let mut vals = [0f32; 32];
                 for (i, &b) in bytes.iter().enumerate() {
@@ -210,7 +199,7 @@ pub(super) fn render_pcm(
                 None
             };
             let register = if kind == Kind::Noise {
-                noise_register(rom, game, note.pitch_fixed)
+                noise_register(rom, playback, note.pitch_fixed)
             } else {
                 0
             };
@@ -317,7 +306,7 @@ pub(super) fn write_wav(path: &Path, pcm: &[i16], rate: u32, stereo: bool) -> Re
 }
 pub(super) fn synthesize(
     rom: &[u8],
-    game: Game,
+    playback: Playback,
     channels: &[Decoded],
     kinds: &[Kind],
     drums: &[Decoded],
@@ -331,7 +320,7 @@ pub(super) fn synthesize(
     all_kinds.extend(std::iter::repeat_n(Kind::Noise, drums.len()));
     let (pcm, notes, peak) = render_pcm(
         rom,
-        game,
+        playback,
         &all,
         &all_kinds,
         samples,
@@ -352,6 +341,7 @@ pub(super) fn synthesize(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Game, original_playback};
     use super::*;
     #[test]
     fn rom_psg_periods_match_verified_driver_trace() {
@@ -362,9 +352,10 @@ mod tests {
             let verified = crate::verify_rom(&path).unwrap();
             assert_eq!(verified.game, game);
             let rom = verified.bytes;
-            assert_eq!(psg_period(&rom, game, 36 << 8).unwrap(), 0x706);
-            assert_eq!(psg_period(&rom, game, (36 << 8) | 0x80).unwrap(), 0x70d);
-            assert_eq!(noise_register(&rom, game, 31 << 8), 0x52);
+            let playback = original_playback(game, false);
+            assert_eq!(psg_period(&rom, playback, 36 << 8).unwrap(), 0x706);
+            assert_eq!(psg_period(&rom, playback, (36 << 8) | 0x80).unwrap(), 0x70d);
+            assert_eq!(noise_register(&rom, playback, 31 << 8), 0x52);
         }
     }
 }

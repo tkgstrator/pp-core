@@ -1,12 +1,9 @@
-use ppextractor::Game;
+use ppextractor::{Game, scripts};
 use std::collections::BTreeSet;
 
 #[allow(dead_code)]
 #[path = "../src/test_assets.rs"]
 mod test_assets;
-
-#[path = "../src/scripts/mod.rs"]
-mod scripts;
 
 fn compare_tree(actual: &std::path::Path, expected: &std::path::Path) {
     let mut names = std::fs::read_dir(expected)
@@ -18,6 +15,12 @@ fn compare_tree(actual: &std::path::Path, expected: &std::path::Path) {
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
+    if actual.file_name().is_some_and(|name| name == "native") {
+        // The Python oracle predates native launch provenance.
+        actual_names.retain(|name| {
+            names.contains(name) || (name != "entrypoints.tsv" && name != "entrypoint-events")
+        });
+    }
     actual_names.sort();
     assert_eq!(
         actual_names,
@@ -61,7 +64,7 @@ fn parity(game: Game, name: &str) {
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
     scenes.sort();
-    assert_eq!(scenes.len(), if name == "pp4" { 2297 } else { 1638 });
+    assert_eq!(scenes.len(), if name == "pp4" { 2297 } else { 1653 });
     let index = std::fs::read_to_string(temp.path().join("index.tsv")).unwrap();
     assert_eq!(index.lines().count(), scenes.len() + 1);
     assert_eq!(
@@ -127,10 +130,14 @@ fn parity(game: Game, name: &str) {
             yaml.lines()
                 .filter(|line| line.starts_with("    type: "))
                 .count(),
-            native
-                .lines()
-                .filter(|line| line.starts_with("    kind: "))
-                .count()
+            if native.starts_with("offset\tbytes\ttype\tinterpretation\n") {
+                native.lines().skip(1).count()
+            } else {
+                native
+                    .lines()
+                    .filter(|line| line.starts_with("    kind: "))
+                    .count()
+            }
         );
         let labels = yaml
             .lines()

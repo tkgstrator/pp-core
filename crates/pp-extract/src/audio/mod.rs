@@ -1,6 +1,9 @@
 //! Native PP4/PP6 GBA sound extraction.
-mod midi;
+pub(crate) mod midi;
 mod sequence;
+pub(crate) use sequence::TrackFormat;
+mod sound_blob;
+pub use sound_blob::pp6_sound_blob;
 mod soundfont;
 mod synth;
 
@@ -20,6 +23,9 @@ pub struct AudioOptions {
     pub selected_ids: Option<BTreeSet<u32>>,
     pub bgm_seconds: f64,
     pub se_seconds: f64,
+    /// Render only this channel of each sequence in the reference WAV (and
+    /// the percussion it triggers); for comparing one part with hardware.
+    pub solo_channel: Option<usize>,
 }
 impl Default for AudioOptions {
     fn default() -> Self {
@@ -28,6 +34,7 @@ impl Default for AudioOptions {
             selected_ids: None,
             bgm_seconds: 90.0,
             se_seconds: 20.0,
+            solo_channel: None,
         }
     }
 }
@@ -115,30 +122,118 @@ fn sha(data: &[u8]) -> String {
 fn hex(value: usize) -> String {
     format!("{value:#x}")
 }
-fn sample_params(game: Game) -> (usize, usize, usize, usize) {
+pub(crate) fn sample_params(game: Game, pp4_v0: bool) -> (usize, usize, usize, usize) {
+    if pp4_v0 {
+        return (0x6f0794, 0x7fb968, 155, 0x512f64);
+    }
     match game {
         Game::Pp4 => (0x6f101c, 0x7fc1f0, 155, 0x513730),
         Game::Pp6 => (0x722da8, 0x7f53f8, 205, 0x55df6c),
     }
 }
-fn seq_params(game: Game, cat: &str) -> (usize, u32, usize, usize, usize, usize) {
+type SequenceTable = (usize, u32, usize, usize, usize, usize);
+type PercussionTable = (usize, usize, usize);
+
+#[derive(Clone, Copy)]
+pub(crate) struct Playback {
+    pub id: &'static str,
+    pub psg_periods: usize,
+    pub pcm_rates: usize,
+    pub transpose: usize,
+    pub sample_bases: &'static [usize],
+    pub sample_count: usize,
+}
+
+impl Playback {
+    pub(crate) const fn pp5(psg_periods: usize, pcm_rates: usize, transpose: usize) -> Self {
+        Self {
+            id: "pp5",
+            psg_periods,
+            pcm_rates,
+            transpose,
+            sample_bases: &[0, 51],
+            sample_count: 156,
+        }
+    }
+}
+
+fn original_playback(game: Game, pp4_v0: bool) -> Playback {
+    let shift = if pp4_v0 { 0x7cc } else { 0 };
+    match game {
+        Game::Pp4 => Playback {
+            id: "pp4",
+            psg_periods: 0x0ceb1c - shift,
+            pcm_rates: 0x50cbd8 - shift,
+            transpose: 0x5139a8 - shift,
+            sample_bases: &[0, 45, 46],
+            sample_count: 155,
+        },
+        Game::Pp6 => Playback {
+            id: "pp6",
+            psg_periods: 0x0fbab4,
+            pcm_rates: 0x554408,
+            transpose: 0x55e2a8,
+            sample_bases: &[0, 56],
+            sample_count: 205,
+        },
+    }
+}
+
+pub(crate) struct NativeAudioLayout {
+    pub driver: Game,
+    pub playback: Option<Playback>,
+    pub track_format: sequence::TrackFormat,
+    pub bgm: SequenceTable,
+    pub se: SequenceTable,
+    pub percussion: PercussionTable,
+}
+
+impl NativeAudioLayout {
+    fn table(&self, category: &str) -> SequenceTable {
+        if category == "bgm" { self.bgm } else { self.se }
+    }
+}
+
+fn seq_params(game: Game, pp4_v0: bool, cat: &str) -> SequenceTable {
+    let relocation = if pp4_v0 { 0x7cc } else { 0 };
     match (game, cat) {
-        (Game::Pp4, "bgm") => (0x512010, 0x40, 164, 32, 0x0cef6a, 0x113d83),
-        (Game::Pp4, _) => (0x116f2c, 0x200, 190, 8, 0x113d83, 0x116f2c),
+        (Game::Pp4, "bgm") => (
+            0x512010 - relocation,
+            0x40,
+            164,
+            32,
+            0x0cef6a - relocation,
+            0x113d83 - relocation,
+        ),
+        (Game::Pp4, _) => (
+            0x116f2c - relocation,
+            0x200,
+            190,
+            8,
+            0x113d83 - relocation,
+            0x116f2c - relocation,
+        ),
         (Game::Pp6, "bgm") => (0x135f0c, 0x40, 153, 12, 0x0fbeb5, 0x135f0c),
         (Game::Pp6, _) => (0x13bd68, 0x200, 435, 12, 0x136638, 0x13bd68),
     }
 }
-fn perc_params(game: Game) -> (usize, usize, usize) {
+fn perc_params(game: Game, pp4_v0: bool) -> (usize, usize, usize) {
+    let relocation = if pp4_v0 { 0x7cc } else { 0 };
     match game {
-        Game::Pp4 => (0x513c60, 0x11751c, 0x117650),
+        Game::Pp4 => (
+            0x513c60 - relocation,
+            0x11751c - relocation,
+            0x117650 - relocation,
+        ),
         Game::Pp6 => (0x55e574, 0x13d1cc, 0x13d30c),
     }
 }
 
-fn scan_samples(rom: &[u8], game: Game) -> Result<Vec<Sample>> {
+pub(crate) type SampleBank = (usize, usize, usize, usize);
+
+fn scan_samples(rom: &[u8], bank: SampleBank) -> Result<Vec<Sample>> {
     ensure!(rom.len() == 8 * 1024 * 1024, "Expected 8 MiB ROM");
-    let (start, end, expected, table) = sample_params(game);
+    let (start, end, expected, table) = bank;
     let mut pos = start;
     let mut result = Vec::new();
     while pos < end {
@@ -198,13 +293,133 @@ fn scan_samples(rom: &[u8], game: Game) -> Result<Vec<Sample>> {
     Ok(result)
 }
 
+// The indexed banks used by the verified GBA releases store consecutive PCM
+// records and an independent table of offsets relative to the first record.
+pub(crate) fn discover_sample_banks(rom: &[u8]) -> Vec<SampleBank> {
+    const MIN_RECORDS: usize = 32;
+
+    let next = |position: usize| {
+        let header = rom.get(position..)?.get(..16)?;
+        let fields = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+        let (kind, pitch, loop_start, size) = (fields(0), fields(4), fields(8), fields(12));
+        if !matches!(kind, 0 | 0x4000_0000)
+            || pitch % 1024 != 0
+            || !(1000..=96000).contains(&(pitch / 1024))
+            || loop_start >= size
+            || (kind == 0 && loop_start != 0)
+        {
+            return None;
+        }
+        let end = (position.checked_add(20)?.checked_add(size as usize)?) & !3;
+        (end <= rom.len()).then_some(end)
+    };
+    let mut starts = HashMap::<[usize; 3], Vec<usize>>::new();
+    for start in (0..rom.len()).step_by(4) {
+        if let Some((a, b, c)) = next(start)
+            .and_then(|a| next(a).map(|b| (a, b)))
+            .and_then(|(a, b)| next(b).map(|c| (a, b, c)))
+        {
+            starts
+                .entry([a - start, b - start, c - start])
+                .or_default()
+                .push(start);
+        }
+    }
+    let mut banks = Vec::new();
+    for table in (0..rom.len().saturating_sub(15)).step_by(4) {
+        let offsets = |index| le32(rom, table + index * 4).ok().map(|n| n as usize);
+        if offsets(0) != Some(0) {
+            continue;
+        }
+        let prefix = [
+            offsets(1).unwrap(),
+            offsets(2).unwrap(),
+            offsets(3).unwrap(),
+        ];
+        let Some(matches) = starts.get(&prefix) else {
+            continue;
+        };
+        for &start in matches {
+            let mut count = 0;
+            let mut end = start;
+            while let Some(position) = next(end).filter(|_| offsets(count) == Some(end - start)) {
+                end = position;
+                count += 1;
+            }
+            let bank = (start, end, count, table);
+            if count >= MIN_RECORDS && scan_samples(rom, bank).is_ok() {
+                banks.push(bank);
+            }
+        }
+    }
+    banks.sort_unstable();
+    banks.dedup();
+    banks
+}
+
+// The two PP5 Rev 0 variants relocate their PCM metadata and PSG/sequence
+// region independently. Use the discovered PCM index and a PSG table
+// fingerprint as separate anchors, then parse every candidate track.
+pub(crate) fn discover_pp5_audio(rom: &[u8], bank: SampleBank) -> Option<NativeAudioLayout> {
+    const PCM_INDEX: usize = 0x4e7558;
+    const PSG: usize = 0xf22dc;
+    const PSG_HASH: &str = "e3c1e26635c898dbb170d9afb59c30549e57df40874082518ad89ea8dba313e1";
+    const PCM_HASH: &str = "768b2cc5a30c7b0fe0fd6e4dc271c4d6d4fb1a787d16931b3e97a3a792f57d80";
+    const TRANSPOSE_HASH: &str = "57bd765386e510267691026ac8b7470470e563a4fd56a7fb83f97ea57fc7abbb";
+    if bank.2 != 156 {
+        return None;
+    }
+    let pcm = |known| {
+        bank.3
+            .checked_add_signed(known as isize - PCM_INDEX as isize)
+    };
+    let pcm_rates = pcm(0x4e0394)?;
+    let transpose = pcm(0x4e77d0)?;
+    let bgm_table = pcm(0x4e6394)?;
+    let percussion_table = pcm(0x4e7a94)?;
+    if sha(rom.get(pcm_rates..pcm_rates.checked_add(0x1b4)?)?) != PCM_HASH
+        || sha(rom.get(transpose..transpose.checked_add(51)?)?) != TRANSPOSE_HASH
+        || bgm_table.checked_add(117 * 32)? > rom.len()
+        || percussion_table.checked_add(64)? > rom.len()
+    {
+        return None;
+    }
+    let mut matches = rom
+        .windows(0x400)
+        .step_by(4)
+        .enumerate()
+        .filter_map(|(index, data)| {
+            (data.starts_with(&[0x20, 0, 0x95, 0, 0xfd, 0, 0x5a, 1]) && sha(data) == PSG_HASH)
+                .then_some(index * 4)
+        });
+    let psg_periods = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let psg = |known| psg_periods + (known - PSG);
+    if psg(0x13ad18) > rom.len() || psg(0x13a354) + 274 * 8 > rom.len() {
+        return None;
+    }
+    let layout = NativeAudioLayout {
+        driver: Game::Pp4,
+        playback: Some(Playback::pp5(psg_periods, pcm_rates, transpose)),
+        track_format: TrackFormat::Legacy,
+        bgm: (bgm_table, 0x40, 117, 32, psg(0xf26dd), psg(0x13749f)),
+        se: (psg(0x13a354), 0x200, 274, 8, psg(0x13749f), psg(0x13a354)),
+        percussion: (percussion_table, psg(0x13abe4), psg(0x13ad18)),
+    };
+    scan_sequences(rom, layout.driver, &layout).ok()?;
+    scan_percussion(rom, layout.percussion).ok()?;
+    Some(layout)
+}
+
 type SequenceScan = (BTreeMap<String, Vec<Sequence>>, HashMap<usize, usize>);
 
-fn scan_sequences(rom: &[u8], game: Game) -> Result<SequenceScan> {
+fn scan_sequences(rom: &[u8], game: Game, layout: &NativeAudioLayout) -> Result<SequenceScan> {
     let mut result = BTreeMap::new();
     let mut ends = HashMap::new();
     for cat in ["bgm", "se"] {
-        let (table, first, count, width, region_start, region_end) = seq_params(game, cat);
+        let (table, first, count, width, region_start, region_end) = layout.table(cat);
         let mut seqs = Vec::new();
         let mut starts = Vec::new();
         let mut modes = HashMap::new();
@@ -231,6 +446,13 @@ fn scan_sequences(rom: &[u8], game: Game) -> Result<SequenceScan> {
                             .map(|v| format!("{v:02x}"))
                             .collect();
                         (f, None, le32(rom, descriptor + 4)?, Some(aux))
+                    } else if width == 8 {
+                        (
+                            u32::from(le16(rom, descriptor)?),
+                            Some(u32::from(le16(rom, descriptor + 2)?)),
+                            le32(rom, descriptor + 4)?,
+                            None,
+                        )
                     } else {
                         (
                             le32(rom, descriptor)?,
@@ -351,7 +573,7 @@ fn scan_sequences(rom: &[u8], game: Game) -> Result<SequenceScan> {
                     "Missing track end marker before {end:#x}"
                 );
             }
-            sequence::parse_linear(&rom[start..end], start, modes[&start])?;
+            sequence::parse_linear(&rom[start..end], start, modes[&start], layout.track_format)?;
             ends.insert(start, end);
         }
         result.insert(cat.to_string(), seqs);
@@ -359,8 +581,7 @@ fn scan_sequences(rom: &[u8], game: Game) -> Result<SequenceScan> {
     Ok((result, ends))
 }
 
-fn scan_percussion(rom: &[u8], game: Game) -> Result<Vec<Percussion>> {
-    let (table, first, end) = perc_params(game);
+fn scan_percussion(rom: &[u8], (table, first, end): PercussionTable) -> Result<Vec<Percussion>> {
     let mut starts = Vec::new();
     for i in 0..16 {
         starts.push(
@@ -376,7 +597,12 @@ fn scan_percussion(rom: &[u8], game: Game) -> Result<Vec<Percussion>> {
     let mut result = Vec::new();
     for i in 0..16 {
         let stop = starts.get(i + 1).copied().unwrap_or(end);
-        let tokens = sequence::parse_linear(&rom[starts[i]..stop], starts[i], Kind::Noise)?;
+        let tokens = sequence::parse_linear(
+            &rom[starts[i]..stop],
+            starts[i],
+            Kind::Noise,
+            sequence::TrackFormat::Legacy,
+        )?;
         ensure!(
             tokens.last().map(|x| x.end) == Some(stop),
             "Invalid percussion stream boundary"
@@ -391,60 +617,25 @@ fn scan_percussion(rom: &[u8], game: Game) -> Result<Vec<Percussion>> {
     Ok(result)
 }
 
-pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
-    extract_with_options(rom, out, game, &AudioOptions::default())
+pub(crate) fn export_samples(rom: &[u8], root: &Path, bank: SampleBank) -> Result<()> {
+    let samples = scan_samples(rom, bank)?;
+    let records = write_samples(rom, root, &samples)?;
+    let (start, end, count, index_table) = bank;
+    let manifest = json!({
+        "rom_sha256": sha(rom),
+        "bank": {"start": hex(start), "end_exclusive": hex(end), "count": count, "index_table": hex(index_table)},
+        "samples": records,
+    });
+    fs::write(
+        root.join("samples-manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(())
 }
 
-pub fn extract_with_options(
-    rom: &[u8],
-    out: &Path,
-    game: Game,
-    options: &AudioOptions,
-) -> Result<()> {
-    ensure!(
-        options.bgm_seconds > 0.0 && options.se_seconds > 0.0,
-        "Audio duration caps must be positive"
-    );
-    ensure!(
-        rom.len() == 8 * 1024 * 1024
-            && rom.get(0xac..0xb0) == Some(game.code().as_bytes())
-            && rom[0xbc] == game.revision(),
-        "Expected verified {} revision {} ROM",
-        game.code(),
-        game.revision()
-    );
-    let digest = sha(rom);
-    ensure!(
-        digest == game.expected_sha256(),
-        "{} SHA-256 mismatch: {digest}",
-        game.code()
-    );
-    let samples = scan_samples(rom, game)?;
-    let (sequences, ends) = scan_sequences(rom, game)?;
-    let percussion = scan_percussion(rom, game)?;
-    if let Some(ids) = &options.selected_ids {
-        for id in ids {
-            ensure!(
-                sequences
-                    .values()
-                    .flat_map(|v| v.iter())
-                    .any(|s| s.id == *id),
-                "Unknown audio ID {id:#x}"
-            );
-        }
-    }
-    let root = out;
-    for directory in [
-        "samples",
-        "bgm",
-        "se",
-        "native/samples",
-        "native/percussion",
-        "native/bgm",
-        "native/se",
-    ] {
-        fs::create_dir_all(root.join(directory))?;
-    }
+fn write_samples(rom: &[u8], root: &Path, samples: &[Sample]) -> Result<Vec<Value>> {
+    fs::create_dir_all(root.join("samples"))?;
+    fs::create_dir_all(root.join("native/samples"))?;
     let mut sample_json = Vec::new();
     for (i, s) in samples.iter().enumerate() {
         let name = format!("{:06x}", s.offset);
@@ -461,6 +652,114 @@ pub fn extract_with_options(
             "sample_type":hex(s.sample_type as usize),"pitch_q10":hex(s.pitch_q10 as usize),"sample_rate_hz":s.rate,
             "loop_enabled":s.looped(),"loop_start":s.loop_start,"length":s.length,"trailer_hex":s.trailer_hex}));
     }
+    Ok(sample_json)
+}
+
+pub fn extract(rom: &[u8], out: &Path, game: Game) -> Result<()> {
+    extract_with_options(rom, out, game, &AudioOptions::default())
+}
+
+pub fn extract_with_options(
+    rom: &[u8],
+    out: &Path,
+    game: Game,
+    options: &AudioOptions,
+) -> Result<()> {
+    ensure!(
+        options.bgm_seconds > 0.0 && options.se_seconds > 0.0,
+        "Audio duration caps must be positive"
+    );
+    let pp4_v0 = game == Game::Pp4 && rom.get(0xbc) == Some(&0);
+    let revision = if pp4_v0 { 0 } else { game.revision() };
+    ensure!(
+        rom.len() == 8 * 1024 * 1024
+            && rom.get(0xac..0xb0) == Some(game.code().as_bytes())
+            && rom[0xbc] == revision,
+        "Expected verified {} revision {} ROM",
+        game.code(),
+        revision
+    );
+    let digest = sha(rom);
+    ensure!(
+        game.accepts_sha256(&digest),
+        "{} SHA-256 mismatch: {digest}",
+        game.code()
+    );
+    let layout = original_layout(game, pp4_v0);
+    export_audio(
+        rom,
+        out,
+        game,
+        sample_params(game, pp4_v0),
+        &layout,
+        options,
+        digest,
+    )
+}
+
+fn original_layout(game: Game, pp4_v0: bool) -> NativeAudioLayout {
+    NativeAudioLayout {
+        driver: game,
+        playback: Some(original_playback(game, pp4_v0)),
+        track_format: sequence::TrackFormat::Legacy,
+        bgm: seq_params(game, pp4_v0, "bgm"),
+        se: seq_params(game, pp4_v0, "se"),
+        percussion: perc_params(game, pp4_v0),
+    }
+}
+
+pub(crate) fn export_native_audio(
+    rom: &[u8],
+    out: &Path,
+    samples: SampleBank,
+    layout: &NativeAudioLayout,
+) -> Result<()> {
+    let options = AudioOptions {
+        render_tracks: layout.playback.is_some(),
+        ..AudioOptions::default()
+    };
+    export_audio(rom, out, layout.driver, samples, layout, &options, sha(rom))
+}
+
+fn pp7_sound_target(kind: Kind, opcode: u8, id: u32) -> Option<(&'static str, usize)> {
+    match (kind, opcode, id) {
+        (Kind::Pcm, 0xf5, 0x3b8) => Some(("se", 0x3b9)),
+        (Kind::Pcm, 0xf6, 0x272) => Some(("bgm", 0x89)),
+        (Kind::Pcm, _, _) => None,
+        // PSG F5 changes priority. PSG F6 starts SE 0x3b6.
+        (_, 0xf6, _) => Some(("se", 0x3b6)),
+        _ => None,
+    }
+}
+
+fn export_audio(
+    rom: &[u8],
+    out: &Path,
+    game: Game,
+    bank: SampleBank,
+    layout: &NativeAudioLayout,
+    options: &AudioOptions,
+    digest: String,
+) -> Result<()> {
+    let samples = scan_samples(rom, bank)?;
+    let (sequences, ends) = scan_sequences(rom, game, layout)?;
+    let percussion = scan_percussion(rom, layout.percussion)?;
+    if let Some(ids) = &options.selected_ids {
+        for id in ids {
+            ensure!(
+                sequences
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .any(|s| s.id == *id),
+                "Unknown audio ID {id:#x}"
+            );
+        }
+    }
+    let root = out;
+    for directory in ["bgm", "se", "native/percussion", "native/bgm", "native/se"] {
+        fs::create_dir_all(root.join(directory))?;
+    }
+    let sample_json = write_samples(rom, root, &samples)?;
     let mut perc_json = Vec::new();
     for p in &percussion {
         let rel = format!("native/percussion/{:02x}.bin", p.index);
@@ -473,11 +772,13 @@ pub fn extract_with_options(
     let mut keysets = soundfont::PsgKeys::default();
     let mut bgm_midis = 0;
     let mut se_midis = 0;
+    let mut bgm_renders = 0;
+    let mut se_renders = 0;
     let mut triggers = 0;
     let mut silent = 0;
     for cat in ["bgm", "se"] {
         let mut items = Vec::new();
-        let (_, _, _, _, _, region_end) = seq_params(game, cat);
+        let (_, _, _, _, _, region_end) = layout.table(cat);
         for seq in &sequences[cat] {
             let stem = format!("{cat}/{:03x}", seq.id);
             let native_prefix = format!("native/{stem}");
@@ -495,24 +796,47 @@ pub fn extract_with_options(
                 item["pointer_list"] = json!({"offset":hex(pointer),"raw":format!("{native_prefix}/pointers.bin"),"sha256":sha(data)});
             }
             let mut track_json = Vec::new();
+            let mut sound_calls = Vec::new();
             for (channel, &start) in seq.starts.iter().enumerate() {
                 let end = ends[&start];
                 let data = &rom[start..end];
-                let tokens = sequence::parse_linear(data, start, seq.kinds[channel])?;
+                let tokens =
+                    sequence::parse_linear(data, start, seq.kinds[channel], layout.track_format)?;
+                if layout.track_format == TrackFormat::Pp7 {
+                    let kind = seq.kinds[channel];
+                    let mut command_offset = start;
+                    for token in &tokens {
+                        if let Some((category, id)) = pp7_sound_target(kind, token.opcode, seq.id) {
+                            sound_calls.push(json!({
+                                "channel": channel,
+                                "command_offset": hex(command_offset),
+                                "opcode": hex(usize::from(token.opcode)),
+                                "target_category": category,
+                                "target_id": hex(id),
+                            }));
+                        }
+                        command_offset = token.end;
+                    }
+                }
                 let rel = format!("{native_prefix}/track_{channel:02}.bin");
                 fs::write(root.join(&rel), data)?;
-                let term = tokens.last().unwrap().end;
+                let term = tokens.last().context("Track had no terminator")?.end;
                 track_json.push(json!({"channel":channel,"mode":seq.kinds[channel].mode(),"kind":seq.kinds[channel].as_str(),
                     "start":hex(start),"end_exclusive":hex(end),"boundary_basis":if end==region_end{"declared track region end"}else{"next referenced track"},
                     "linear_token_count":tokens.len(),"first_terminator_end":hex(term),"post_terminator_bytes":end-term,"raw":rel,"sha256":sha(data)}));
             }
             item["tracks"] = json!(track_json);
+            let has_sound_calls = !sound_calls.is_empty();
+            if has_sound_calls {
+                item["static_sound_calls"] = json!(sound_calls);
+            }
             if options.render_tracks
                 && options
                     .selected_ids
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&seq.id))
             {
+                let playback = layout.playback.context("Missing audio playback tables")?;
                 let cap = if cat == "bgm" {
                     options.bgm_seconds
                 } else {
@@ -527,20 +851,83 @@ pub fn extract_with_options(
                         max_frames,
                         seq.kinds[channel],
                         seq.psg_types[channel],
-                        game,
+                        playback,
+                        layout.track_format,
                     )?);
                 }
-                for (d, &kind) in decoded.iter().zip(&seq.kinds) {
+                let mut kinds = seq.kinds.clone();
+                if has_sound_calls {
+                    let mut timeline = Vec::new();
+                    for (channel, track) in decoded.iter().enumerate() {
+                        for &(frame, offset, opcode) in &track.sound_commands {
+                            if let Some((category, id)) =
+                                pp7_sound_target(seq.kinds[channel], opcode, seq.id)
+                            {
+                                timeline.push((frame, channel, offset, opcode, category, id));
+                            }
+                        }
+                    }
+                    timeline.sort_by_key(|&(frame, channel, ..)| (frame, channel));
+                    item["preview_sound_calls"] = json!(
+                        timeline
+                            .iter()
+                            .map(|&(frame, channel, offset, opcode, category, id)| json!({
+                                "update": frame,
+                                "channel": channel,
+                                "command_offset": hex(offset),
+                                "opcode": hex(usize::from(opcode)),
+                                "target_category": category,
+                                "target_id": hex(id),
+                            }))
+                            .collect::<Vec<_>>()
+                    );
+                    for (frame, _, _, _, category, id) in timeline {
+                        let target = sequences[category]
+                            .iter()
+                            .find(|target| target.id as usize == id)
+                            .with_context(|| {
+                                format!("Missing PP7 sound call target {category} {id:#x}")
+                            })?;
+                        for (channel, &start) in target.starts.iter().enumerate() {
+                            let kind = target.kinds[channel];
+                            let mut track = sequence::decode(
+                                &rom[start..ends[&start]],
+                                start,
+                                max_frames - frame,
+                                kind,
+                                target.psg_types[channel],
+                                playback,
+                                layout.track_format,
+                            )?;
+                            ensure!(
+                                !track.sound_commands.iter().any(|&(_, _, opcode)| {
+                                    pp7_sound_target(kind, opcode, target.id).is_some()
+                                }),
+                                "Nested PP7 sound call in {category} {id:#x}"
+                            );
+                            track.end_frame += frame;
+                            for event in &mut track.events {
+                                event.frame += frame;
+                            }
+                            decoded.push(track);
+                            kinds.push(kind);
+                        }
+                    }
+                    item.as_object_mut()
+                        .unwrap()
+                        .remove("unsupported_playback_opcodes");
+                }
+                for (d, &kind) in decoded.iter().zip(&kinds) {
                     keysets.note_keys(d, kind);
                 }
                 let mut drums = Vec::new();
-                for (d, &kind) in decoded.iter().zip(&seq.kinds) {
+                for (d, &kind) in decoded.iter().zip(&kinds) {
                     if kind == Kind::Control {
                         drums.extend(sequence::expand_percussion(
                             rom,
                             d,
                             &percussion,
-                            game,
+                            playback,
                             max_frames,
                         )?);
                     }
@@ -556,21 +943,38 @@ pub fn extract_with_options(
                 let midi_path = root.join(&midi_rel);
                 let midi_info = midi::write_midi(
                     &decoded,
-                    &seq.kinds,
+                    &kinds,
                     &midi_path,
                     &format!(
                         "{} {} {:#x}",
-                        game.id().to_uppercase(),
+                        playback.id.to_uppercase(),
                         cat.to_uppercase(),
                         seq.id
                     ),
                 )?;
+                item["midi"] = json!({"path":midi_rel,"notes":midi_info.notes,"tracks":midi_info.tracks,
+                    "sha256":midi_info.sha256,"update_rate_hz":DRIVER_UPDATE_HZ,"timebase":"960 ticks per second","native_soundfont":true});
+                if cat == "bgm" {
+                    bgm_midis += 1;
+                } else {
+                    se_midis += 1;
+                }
                 let wav_path = root.join(&wav_rel);
+                if let Some(solo) = options.solo_channel {
+                    for (channel, track) in decoded.iter_mut().enumerate() {
+                        if channel != solo {
+                            track.events.clear();
+                        }
+                    }
+                    if kinds.get(solo) != Some(&Kind::Control) {
+                        drums.clear();
+                    }
+                }
                 let wav_info = synth::synthesize(
                     rom,
-                    game,
+                    playback,
                     &decoded,
-                    &seq.kinds,
+                    &kinds,
                     &drums,
                     &samples,
                     synth::WavOutput {
@@ -579,8 +983,6 @@ pub fn extract_with_options(
                         stereo: true,
                     },
                 )?;
-                item["midi"] = json!({"path":midi_rel,"notes":midi_info.notes,"tracks":midi_info.tracks,
-                    "sha256":midi_info.sha256,"update_rate_hz":DRIVER_UPDATE_HZ,"timebase":"960 ticks per second","native_soundfont":true});
                 item["wav"] = json!({"path":wav_rel,"sha256":wav_info.sha256,"sample_rate_hz":32768,
                     "channels":2,"sample_frames":wav_info.frames,"duration_seconds":wav_info.frames as f64/32768.0,
                     "peak":wav_info.peak,"notes":wav_info.notes,
@@ -601,17 +1003,12 @@ pub fn extract_with_options(
                     silent += 1;
                 }
                 if cat == "bgm" {
-                    bgm_midis += 1;
+                    bgm_renders += 1;
                 } else {
-                    se_midis += 1;
+                    se_renders += 1;
                 }
             } else {
-                for extension in ["mid", "wav"] {
-                    let p = root.join(format!("{stem}.{extension}"));
-                    if p.exists() {
-                        fs::remove_file(p)?;
-                    }
-                }
+                remove_track_renders(root, &stem)?;
             }
             items.push(item);
         }
@@ -620,7 +1017,7 @@ pub fn extract_with_options(
     let soundfont_info = if options.render_tracks {
         Some(soundfont::write_soundfont(
             rom,
-            game,
+            layout.playback.context("Missing audio playback tables")?,
             &samples,
             &percussion,
             &keysets,
@@ -633,25 +1030,25 @@ pub fn extract_with_options(
         }
         None
     };
-    let (start, end, count, index_table) = sample_params(game);
+    let (start, end, count, index_table) = bank;
     let mut tables = serde_json::Map::new();
     for cat in ["bgm", "se"] {
-        let (table, first, n, width, lo, hi) = seq_params(game, cat);
+        let (table, first, n, width, lo, hi) = layout.table(cat);
         tables.insert(
             cat.to_string(),
             json!({"offset":hex(table),"first_id":hex(first as usize),"entry_count":n,
             "descriptor_bytes":width,"track_region":[hex(lo),hex(hi)]}),
         );
     }
-    let manifest = json!({"rom_game_code":game.code(),"rom_sha256":digest,
+    let manifest = json!({"rom_game_code":String::from_utf8_lossy(&rom[0xac..0xb0]),"rom_sha256":digest,
         "source_range":{"start":hex(start),"end_exclusive":hex(end)},
         "sample_index_table":{"offset":hex(index_table),"base":hex(start),"entry_count":count,"encoding":"u32 little-endian relative offsets"},
         "sample_format":"mono signed 8-bit PCM in ROM; WAV uses unsigned 8-bit PCM",
         "pitch_units":"Q10 sample playback rate at source pitch 36 before per-sample transposition",
-        "sequence_status":format!("verified native BGM/SE descriptors and bounded tracks; {}",if options.render_tracks{"direct note transcriptions and reference WAVs"}else{"playback undecoded"}),
+        "sequence_status":format!("verified native BGM/SE descriptors and bounded tracks; {}",if layout.track_format == TrackFormat::Pp7 {"reference playback including timed sound calls"} else if options.render_tracks{"direct note transcriptions and reference WAVs"}else{"playback undecoded"}),
         "classification":format!("native BGM/SE bytecode and playable PCM samples; {}",if options.render_tracks{"MIDI with companion ROM SoundFont and approximate WAV synthesis"}else{"no complete track renders"}),
         "counts":{"sample_wavs":samples.len(),"raw_records":samples.len(),"bgm_sequences":sequences["bgm"].len(),"se_sequences":sequences["se"].len(),
-            "raw_tracks":ends.len(),"bgm_midis":bgm_midis,"se_midis":se_midis,"bgm_renders":bgm_midis,"se_renders":se_midis,
+            "raw_tracks":ends.len(),"bgm_midis":bgm_midis,"se_midis":se_midis,"bgm_renders":bgm_renders,"se_renders":se_renders,
             "percussion_subtracks":percussion.len(),"percussion_triggers":triggers,"silent_renders":silent},
         "conversion_policy":{"driver_update_hz":DRIVER_UPDATE_HZ,"timer2":"16777216 / (64 * 1049 * 4) channel updates per second",
             "bgm_cap_seconds":options.bgm_seconds,"se_cap_seconds":options.se_seconds,
@@ -664,6 +1061,16 @@ pub fn extract_with_options(
         "soundfont":soundfont_info,"samples":sample_json});
     let payload = serde_json::to_string_pretty(&manifest)? + "\n";
     fs::write(root.join("manifest.json"), payload)?;
+    Ok(())
+}
+
+fn remove_track_renders(root: &Path, stem: &str) -> Result<()> {
+    for extension in ["mid", "wav"] {
+        let p = root.join(format!("{stem}.{extension}"));
+        if p.exists() {
+            fs::remove_file(p)?;
+        }
+    }
     Ok(())
 }
 
@@ -682,4 +1089,52 @@ fn write_sample_wav(path: &Path, data: &[u8], rate: u32) -> Result<()> {
     }
     writer.finalize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod bank_discovery_tests {
+    use super::*;
+    use crate::rom::{PROFILES, verify_supported_rom};
+
+    #[test]
+    fn discovers_each_known_roms_pcm_bank() {
+        for profile in PROFILES {
+            let Some(path) = crate::test_assets::rom(profile.id) else {
+                continue;
+            };
+            let (verified, rom) = verify_supported_rom(&path).unwrap();
+            assert_eq!(verified.id, profile.id);
+            let expected = profile
+                .samples
+                .or_else(|| {
+                    profile
+                        .game
+                        .map(|game| sample_params(game, profile.id == "pp4_v0"))
+                })
+                .unwrap();
+            assert_eq!(discover_sample_banks(&rom), [expected], "{}", profile.id);
+        }
+    }
+    #[test]
+    fn relocates_both_pp5_audio_regions_without_fixed_rom_offsets() {
+        for id in ["pp5_v0", "pp5_v0_p"] {
+            let Some(path) = crate::test_assets::rom(id) else {
+                continue;
+            };
+            let (profile, mut rom) = verify_supported_rom(&path).unwrap();
+            let bank = discover_sample_banks(&rom)[0];
+            let layout = discover_pp5_audio(&rom, bank).unwrap();
+            let known = profile.native_audio.as_ref().unwrap();
+            assert_eq!(layout.bgm, known.bgm);
+            assert_eq!(layout.se, known.se);
+            assert_eq!(layout.percussion, known.percussion);
+            let (found, expected) = (layout.playback.unwrap(), known.playback.unwrap());
+            assert_eq!(
+                (found.psg_periods, found.pcm_rates, found.transpose),
+                (expected.psg_periods, expected.pcm_rates, expected.transpose)
+            );
+            rom[found.pcm_rates + 10] ^= 1;
+            assert!(discover_pp5_audio(&rom, bank).is_none());
+        }
+    }
 }

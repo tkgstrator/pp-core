@@ -76,7 +76,14 @@ fn selected_rom_audio_matches_reference_wave_and_midi() {
             } else {
                 relative.clone()
             };
-            let want = std::fs::read(reference.join(&reference_relative)).unwrap();
+            let extracted_path = reference.join(&relative);
+            let reference_path = if extracted_path.is_file() {
+                extracted_path
+            } else {
+                reference.join(&reference_relative)
+            };
+            let want = std::fs::read(&reference_path)
+                .unwrap_or_else(|error| panic!("{}: {error}", reference_path.display()));
             assert_eq!(got.len(), want.len(), "{name} {relative} length");
             if relative.starts_with("bgm/") && relative.ends_with(".wav") {
                 assert_eq!(&got[..44], &want[..44], "{name} {relative} header");

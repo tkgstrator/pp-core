@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/pp-core", "crates/pp-extract"]
+members = ["crates/pp-core", "crates/pp-extract", "crates/pp-sound"]
 resolver = "3"

@@ -253,14 +253,13 @@ mod tests {
     /// Compare against the Python oracle catalog and per-record RGBA digests.
     #[test]
     fn matches_python_oracle_when_available() {
-        for (game, file) in [("pp4", "pp4.gba"), ("pp6", "pp6.gba")] {
+        for game in ["pp4", "pp6"] {
             let Some(rom_path) = crate::test_assets::rom(game) else {
                 continue;
             };
             let Some(dir) = crate::test_assets::oracle(game, "images", "catalog.tsv") else {
                 continue;
             };
-            assert_eq!(rom_path.file_name().unwrap(), file);
             let rom = crate::verify_rom(&rom_path).unwrap().bytes;
             let oracle = std::fs::read_to_string(dir.join("catalog.tsv")).unwrap();
             let temp = tempfile::tempdir().unwrap();

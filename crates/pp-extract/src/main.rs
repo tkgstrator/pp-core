@@ -15,7 +15,7 @@ fn extract_category(category: Only, rom: &[u8], out: &Path, game: ppextractor::G
         Only::Scripts => scripts::extract(rom, out, game)?,
         Only::Portraits => ppextractor::portraits::extract(rom, out, game)?,
         Only::Audio => audio::extract(rom, out, game)?,
-        Only::All => bail!("internal error: all must be expanded before extraction"),
+        Only::All | Only::Samples => bail!("internal error: unexpected category {category:?}"),
     }
     println!("{}: {}", game.id(), out.display());
     Ok(())

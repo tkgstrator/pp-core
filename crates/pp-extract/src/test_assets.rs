@@ -35,11 +35,37 @@ pub fn available(path: &Path) -> bool {
 }
 
 pub fn rom(name: &str) -> Option<PathBuf> {
-    let path = root()?.join("roms").join(format!("{name}.gba"));
+    let base = root()?.join("roms");
+    let revision_file = match name {
+        "pp4" => Some("pp4_v1.gba"),
+        "pp6" => Some("pp6_v0.gba"),
+        _ => None,
+    };
+    if let Some(path) = revision_file.map(|file| base.join(file))
+        && path.is_file()
+    {
+        return Some(path);
+    }
+    let path = base.join(format!("{name}.gba"));
     available(&path).then_some(path)
 }
 
 pub fn oracle(name: &str, category: &str, marker: &str) -> Option<PathBuf> {
-    let path = root()?.join("extracted").join(name).join(category);
-    available(&path.join(marker)).then_some(path)
+    let base = root()?.join("extracted");
+    let legacy = base.join(name).join(category);
+    if legacy.join(marker).exists() {
+        return Some(legacy);
+    }
+    if let Some(number) = name.strip_prefix("pp") {
+        let relative = match category {
+            "portraits" => "images/portraits",
+            "scripts" => "scripts/native",
+            _ => category,
+        };
+        let path = base.join(number).join(relative);
+        if path.join(marker).exists() {
+            return Some(path);
+        }
+    }
+    available(&legacy.join(marker)).then_some(legacy)
 }

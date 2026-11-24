@@ -1,5 +1,5 @@
 use super::semantic::{self, Command};
-use super::{BASE, PP6_HASH, digest, glyph_table, hex, quote, word, write_file};
+use super::{BASE, digest, glyph_table, hex, quote, word, write_file};
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -462,21 +462,84 @@ fn semantic_commands(
         .collect()
 }
 
-pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()> {
+pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path, rom_sha256: &str) -> Result<()> {
     let events = discover(rom)?;
+    let entries = super::native_entrypoints(
+        rom,
+        0x71e8,
+        FIRST,
+        &[
+            (0x6058, 4),
+            (0x3b7e8, 49),
+            (0x3b816, 10),
+            (0x3b8fc, 18),
+            (0x3b98e, 17),
+            (0x3c298, 20),
+            (0x3c310, 4),
+            (0x3c37c, 8),
+            (0x414bc, 6),
+            (0x4c4ea, 12),
+            (0x4c674, 37),
+            (0x4c69e, 10),
+            (0x4c72a, 9),
+            (0x4d542, 15),
+            (0x4d566, 15),
+        ],
+    );
+    let supplemental = entries
+        .iter()
+        .filter(|entry| !events.contains_key(&entry.descriptor))
+        .map(|entry| (entry.descriptor, entry.span))
+        .collect::<BTreeMap<_, _>>();
+
     let starts: Vec<_> = events.values().map(|e| e.start).collect();
     let chars = glyph_table(true);
+    // This event was added after the original supplemental scenes.
+    let appended_descriptor = 0x561910;
+    let supplemental_order = supplemental
+        .keys()
+        .filter(|&&desc| desc != appended_descriptor)
+        .chain(
+            supplemental
+                .get_key_value(&appended_descriptor)
+                .map(|(desc, _)| desc),
+        );
     let scene_ids = events
         .keys()
+        .chain(supplemental_order.clone())
         .enumerate()
         .map(|(i, desc)| (*desc, semantic::scene_id("pp6", i + 1)))
         .collect::<BTreeMap<_, _>>();
     let mut state_words = BTreeSet::new();
-    for (desc, event) in &events {
-        let i = starts.partition_point(|&s| s < *desc);
-        let ref_end = starts.get(i).copied().unwrap_or(END);
-        let (rows, _, _, _) = decode(rom, *desc, event.start, event.end, ref_end, &chars)?;
-        for row in rows {
+    let mut supplemental_states = BTreeSet::new();
+    let mut supplemental_rows = BTreeMap::new();
+    for (desc, start, end, ref_end, is_supplemental) in events
+        .iter()
+        .map(|(&desc, event)| {
+            let i = starts.partition_point(|&s| s < desc);
+            (
+                desc,
+                event.start,
+                event.end,
+                starts.get(i).copied().unwrap_or(END),
+                false,
+            )
+        })
+        .chain(supplemental.iter().map(|(&desc, &(start, end))| {
+            let ref_end = supplemental
+                .range(desc + 1..)
+                .next()
+                .map_or(FIRST, |(_, &(start, _))| start);
+            (desc, start, end, ref_end, true)
+        }))
+    {
+        let (rows, _, _, _) = decode(rom, desc, start, end, ref_end, &chars)?;
+        let states = if is_supplemental {
+            &mut supplemental_states
+        } else {
+            &mut state_words
+        };
+        for row in &rows {
             let raw = &row.raw;
             let indexes: Vec<u8> = match row.kind.as_str() {
                 "CONDITIONAL" => vec![raw[3]],
@@ -491,11 +554,20 @@ pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()>
                 _ => vec![],
             };
             for index in indexes {
-                state_words.insert(word(rom, *desc + 4 + 4 * index as usize));
+                states.insert(word(rom, desc + 4 + 4 * index as usize));
             }
         }
+        if is_supplemental {
+            supplemental_rows.insert(desc, rows);
+        }
     }
-    let state_ids = semantic::state_ids("pp6", state_words);
+    let state_ids = semantic::state_ids(
+        "pp6",
+        state_words
+            .iter()
+            .copied()
+            .chain(supplemental_states.difference(&state_words).copied()),
+    );
     let mut semantic_index = String::from("scene_id\tscene_file\tnative_scene\n");
     let mut schedule = String::from(
         "grid\tmajor_index\tmonth_index\tslot_index\trom_offset\tencoded_id\tevent_id\tdescriptor\n",
@@ -571,7 +643,7 @@ pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()>
         let body_hash = digest(&rom[event.start..event.end]);
         let mut yaml = format!(
             "---\nformat_version: 1\ngame: \"pp6\"\nrom_sha256: {sha}\ndescriptor_offset: {desc_q}\nbody:\n  start_offset: {start_q}\n  end_offset_exclusive: {end_q}\n  sha256: {body_q}\n  padding_hex: {padding}\nprovenance:\n  incoming_word_offsets:",
-            sha = quote(PP6_HASH),
+            sha = quote(rom_sha256),
             desc_q = quote(&format!("0x{desc:06x}")),
             start_q = quote(&format!("0x{:06x}", event.start)),
             end_q = quote(&format!("0x{:06x}", event.end)),
@@ -662,6 +734,45 @@ pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()>
             *unresolved.entry(key).or_insert(0) += count;
         }
     }
+    let supplemental_dir = out.join("entrypoint-events");
+    std::fs::create_dir_all(&supplemental_dir)?;
+    let mut supplemental_index =
+        String::from("descriptor\tstart\tend_exclusive\tsha256\tfile\tlisting\n");
+    for &desc in supplemental_order {
+        let (start, end) = supplemental[&desc];
+        let rows = &supplemental_rows[&desc];
+        let scene_id = &scene_ids[&desc];
+        let commands = semantic_commands(rom, desc, end, rows, &scene_ids, &state_ids);
+        let scene_file = semantic::write_scene(semantic_out, "pp6", scene_id, &commands)?;
+        writeln!(
+            semantic_index,
+            "{scene_id}\t{scene_file}\tnative/entrypoint-events/{desc:06x}.tsv"
+        )?;
+        let mut listing = String::from("offset\tbytes\ttype\tinterpretation\n");
+        for row in rows {
+            writeln!(
+                listing,
+                "{:06x}\t{}\t{}\t{}",
+                row.at,
+                hex(&row.raw),
+                row.kind,
+                row.detail.replace(['\t', '\r', '\n'], " ")
+            )?;
+        }
+        let relative = format!("entrypoint-events/{desc:06x}");
+        let body = &rom[start..end];
+        std::fs::write(out.join(format!("{relative}.bin")), body)?;
+        write_file(&out.join(format!("{relative}.tsv")), &listing)?;
+        writeln!(
+            supplemental_index,
+            "{desc:06x}\t{start:06x}\t{end:06x}\t{}\t{relative}.bin\t{relative}.tsv",
+            digest(body)
+        )?;
+    }
+    write_file(&supplemental_dir.join("index.tsv"), &supplemental_index)?;
+    super::write_entrypoints(out, &entries, |descriptor| {
+        events.contains_key(&descriptor) || supplemental.contains_key(&descriptor)
+    })?;
     write_file(&out.join("manifest.tsv"), &manifest)?;
     write_file(&out.join("schedule.tsv"), &schedule)?;
     let mut unresolved_tsv = String::from("opcode\tcount\n");
@@ -672,7 +783,7 @@ pub(super) fn extract(rom: &[u8], out: &Path, semantic_out: &Path) -> Result<()>
     let unique: BTreeSet<_> = scheduled.keys().collect();
     let summary = format!(
         "{{\n  \"rom_sha256\": {},\n  \"descriptors\": {},\n  \"script_bytes\": {},\n  \"choice_menus\": {},\n  \"nonzero_fixed_slots\": {},\n  \"unique_fixed_descriptors\": {},\n  \"unknown_opcode_occurrences\": {}\n}}\n",
-        quote(PP6_HASH),
+        quote(rom_sha256),
         events.len(),
         raw_bytes,
         count_choices,

@@ -1,5 +1,8 @@
 use super::semantic::{self, Command};
-use super::{BASE, PP4_HASH, decode_pp4, digest, glyph_table, hex, quote, word, write_file};
+use super::{
+    BASE, bounds, decode_pp4, digest, discover_descriptors, glyph_table, hex, quote, word,
+    write_file,
+};
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,21 +31,6 @@ struct Parsed {
     choices: usize,
 }
 
-fn bounds(data: &[u8], desc: usize) -> Option<(usize, usize)> {
-    if desc + 4 > data.len() {
-        return None;
-    }
-    let start = word(data, desc).checked_sub(BASE)?;
-    if !(start < desc && start % 4 == 0 && desc - start <= 0x4000) {
-        return None;
-    }
-    let mut end = desc;
-    while end > desc - 3 && data[end - 1] == 0 {
-        end -= 1;
-    }
-    (data[end - 1] == 0xff).then_some((start, end))
-}
-
 fn find(data: &[u8], pattern: &[u8], begin: usize, end: usize) -> Option<usize> {
     if pattern.is_empty() || end < pattern.len() {
         return None;
@@ -50,7 +38,7 @@ fn find(data: &[u8], pattern: &[u8], begin: usize, end: usize) -> Option<usize> 
     (begin..=end - pattern.len()).find(|&i| &data[i..i + pattern.len()] == pattern)
 }
 
-fn roots(data: &[u8]) -> Result<BTreeMap<usize, BTreeSet<String>>> {
+fn roots(data: &[u8], pp4_v0: bool) -> Result<BTreeMap<usize, BTreeSet<String>>> {
     let mut result: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     let mut add = |label: String, descriptor: usize| -> Result<()> {
         ensure!(
@@ -76,6 +64,13 @@ fn roots(data: &[u8]) -> Result<BTreeMap<usize, BTreeSet<String>>> {
         ("fantasy.random_pool", 0x5ad370, (0x5ad43c - 0x5ad370) / 4),
     ];
     for (label, offset, count) in tables {
+        let offset = if !pp4_v0 {
+            offset
+        } else if offset < 0x520000 {
+            offset - 0x7cc
+        } else {
+            offset - 0x878
+        };
         for i in 0..count {
             let addr = word(data, offset + 4 * i);
             if addr != 0 {
@@ -99,13 +94,29 @@ fn roots(data: &[u8]) -> Result<BTreeMap<usize, BTreeSet<String>>> {
         ),
     ] {
         for &pc in sites {
+            let relocation = if pp4_v0 {
+                match pc {
+                    ..0x2d000 => 0xd8,
+                    ..0x30000 => 0xec,
+                    ..0x40000 => 0xf4,
+                    _ => 0x148,
+                }
+            } else {
+                0
+            };
+            let pc = pc - relocation;
             let instruction = u16::from_le_bytes(data[pc..pc + 2].try_into().unwrap()) as usize;
             let pool = ((pc + 4) & !3) + 4 * (instruction & 255);
             add(format!("{label}.native@{pc:06X}"), word(data, pool) - BASE)?;
         }
     }
-    add("school.outing_named_person@56E5DC".into(), 0x56e794)?;
-    add("school.yui_store@56E6D5".into(), 0x58709c)?;
+    if pp4_v0 {
+        add("school.outing_named_person".into(), 0x56df94)?;
+        add("school.yui_store".into(), 0x586890)?;
+    } else {
+        add("school.outing_named_person@56E5DC".into(), 0x56e794)?;
+        add("school.yui_store@56E6D5".into(), 0x58709c)?;
+    }
     Ok(result)
 }
 
@@ -127,12 +138,20 @@ fn name(op: u8) -> String {
     }
 }
 
+fn condition_group(op: u8) -> u8 {
+    [0x49, 0x40, 0x37, 0x2e]
+        .into_iter()
+        .find(|&group| op >= group - 1)
+        .unwrap()
+}
+
 fn parse(
     data: &[u8],
     desc: usize,
     start: usize,
     end: usize,
     chars: &[Option<char>],
+    operand_overrides: &[(u8, i8)],
 ) -> Result<Parsed> {
     let mut rows = Vec::new();
     let mut refs = Vec::new();
@@ -184,7 +203,10 @@ fn parse(
             }
             let op = data[p];
             p += 1;
-            let width = ARGC[op as usize];
+            let width = operand_overrides
+                .iter()
+                .find_map(|&(command, width)| (command == op).then_some(width))
+                .unwrap_or(ARGC[op as usize]);
             let mut k = name(op);
             if width == -1 {
                 ensure!(p < end, "Missing choice count");
@@ -251,10 +273,7 @@ fn parse(
                     .iter()
                     .fold(0usize, |a, b| (a << 8) | *b as usize);
                 let variable = word(data, desc + 4 + 4 * index);
-                let group = [0x49, 0x40, 0x37, 0x2e]
-                    .into_iter()
-                    .find(|&g| op >= g - 1)
-                    .unwrap();
+                let group = condition_group(op);
                 let relation_id = if op == group - 1 {
                     0
                 } else {
@@ -353,6 +372,248 @@ fn parse(
         warnings,
         choices,
     })
+}
+
+pub(super) struct NativeSwitch {
+    pub offset: usize,
+    pub slot: u8,
+    pub end: Option<usize>,
+    pub cases: Vec<(u8, usize)>,
+}
+
+pub(super) struct NativeListingOutput {
+    pub text: String,
+    pub references: Vec<(usize, usize, String)>,
+    pub sound_requests: Vec<(usize, u16)>,
+    pub conditions: Vec<(usize, usize, Option<usize>)>,
+    pub switches: Vec<NativeSwitch>,
+}
+
+pub(super) fn native_listing(
+    data: &[u8],
+    descriptor: usize,
+    start: usize,
+    end: usize,
+    chars: &[Option<char>],
+    format: super::NativeListing,
+) -> Result<Option<NativeListingOutput>> {
+    let parsed = parse(
+        data,
+        descriptor,
+        start,
+        end,
+        chars,
+        format.operand_overrides,
+    )?;
+    if !parsed.warnings.is_empty() || parsed.rows.last().is_none_or(|row| row.kind != "end") {
+        return Ok(None);
+    }
+    if parsed.rows.iter().any(|row| {
+        matches!(row.raw.as_slice(), [0xf8 | 0xf9, opcode, ..] if format.unchecked_opcodes.contains(opcode))
+    }) {
+        return Ok(None);
+    }
+    if format.portrait_sentinels == super::PortraitSentinels::Unchecked
+        && parsed
+            .rows
+            .iter()
+            .any(|row| matches!(row.raw.as_slice(), [0xfd | 0xfe, 0xf9..=0xfe]))
+    {
+        return Ok(None);
+    }
+    let mut listing = String::from("offset\tbytes\ttype\tinterpretation\n");
+    let mut sound_requests = Vec::new();
+    let mut conditions = Vec::new();
+    let mut switches = Vec::new();
+    for row in parsed.rows {
+        let special = format.portrait_sentinels == super::PortraitSentinels::Pp7
+            && matches!(row.raw.as_slice(), [0xfd | 0xfe, 0xf9..=0xfe]);
+        let (kind, mut caption) = match row.raw.as_slice() {
+            [0xf8 | 0xf9, 0x01] => ("wait_page", "wait for page acknowledgement".into()),
+            [0xf8 | 0xf9, op @ 0x03..=0x06] => {
+                let delay = [0, 2, 4, 8][usize::from(*op - 0x03)];
+                ("text_delay", format!("text pacing counter = {delay}"))
+            }
+            // The sound dispatcher receives this big-endian ID and may remap it at runtime.
+            [0xf8 | 0xf9, 0x07, hi, lo] => {
+                let id = u16::from_be_bytes([*hi, *lo]);
+                sound_requests.push((row.at, id));
+                ("sound_request", format!("encoded sound ID {id:#06x}"))
+            }
+            [0xf8 | 0xf9, op @ 0x52..=0x55, selector, argument] => (
+                "effect_dispatch",
+                format!(
+                    "opcode {op:#04x}, selector {selector:#04x}, encoded argument {argument:#04x}"
+                ),
+            ),
+            [0xf8 | 0xf9, op @ (0x56 | 0x57), selector, a, b, c, d] => (
+                "effect_dispatch",
+                format!(
+                    "opcode {op:#04x}, encoded selector {selector:#04x}, encoded argument {:#010x}",
+                    u32::from_be_bytes([*a, *b, *c, *d])
+                ),
+            ),
+            [0xf8 | 0xf9, op @ (0x5b..=0x5d | 0x5f | 0x61), slot, value] => {
+                let kind = match op {
+                    0x5b => "set_u8",
+                    0x5c => "add_u8",
+                    0x5d => "subtract_u8",
+                    0x5f => "and_u8",
+                    _ => "or_u8",
+                };
+                (
+                    kind,
+                    format!("descriptor slot {slot:#04x}, value {value:#04x}"),
+                )
+            }
+            [0xf8 | 0xf9, 0x60, destination, source] => (
+                "copy_u8",
+                format!("descriptor slots {destination:#04x} <- {source:#04x}"),
+            ),
+            [
+                0xf8 | 0xf9,
+                op @ (0x62..=0x64 | 0x66 | 0x68),
+                slot,
+                a,
+                b,
+                c,
+                d,
+            ] => {
+                let kind = match op {
+                    0x62 => "set_u32",
+                    0x63 => "add_u32",
+                    0x64 => "subtract_u32",
+                    0x66 => "and_u32",
+                    _ => "or_u32",
+                };
+                let value = u32::from_be_bytes([*a, *b, *c, *d]);
+                (
+                    kind,
+                    format!("descriptor slot {slot:#04x}, value {value:#010x}"),
+                )
+            }
+            [0xf8 | 0xf9, 0x67, destination, source] => (
+                "copy_u32",
+                format!("descriptor slots {destination:#04x} <- {source:#04x}"),
+            ),
+            [0xf8 | 0xf9, 0x5e, slot, limit] => (
+                "random_u8",
+                format!("descriptor slot {slot:#04x}, encoded limit {limit:#04x}"),
+            ),
+            [0xf8 | 0xf9, 0x65, slot, a, b, c, d] => (
+                "random_u32",
+                format!(
+                    "descriptor slot {slot:#04x}, encoded limit {:#010x}",
+                    u32::from_be_bytes([*a, *b, *c, *d])
+                ),
+            ),
+            [0xf8 | 0xf9, op @ (0x69 | 0x6a), slot] => (
+                if *op == 0x69 { "print_u8" } else { "print_u32" },
+                format!("descriptor slot {slot:#04x}, unsigned decimal"),
+            ),
+            [0xf8 | 0xf9, op @ (0x2f | 0x38 | 0x41 | 0x4a), marker] if op == marker => {
+                ("end_condition", format!("condition group {:#04x}", op - 1))
+            }
+            [0xf8 | 0xf9, op, 2, _, a, b, c, d]
+                if ARGC.get(usize::from(*op)) == Some(&-3)
+                    && !matches!(op, 0x2d | 0x36 | 0x3f | 0x48) =>
+            {
+                let value = i32::from_be_bytes([*a, *b, *c, *d]);
+                let caption = row.caption.replacen("u32", "s32", 1);
+                ("condition", format!("{caption} (signed operand {value})"))
+            }
+            [0xf8 | 0xf9, op, ..] if ARGC.get(usize::from(*op)) == Some(&-3) => {
+                ("condition", row.caption.replace(['\t', '\r', '\n'], " "))
+            }
+            _ if special => (
+                row.kind.as_str(),
+                format!("portrait state command {:#04x}", row.raw[1]),
+            ),
+            _ => (
+                row.kind.as_str(),
+                row.caption.replace(['\t', '\r', '\n'], " "),
+            ),
+        };
+        if kind == "switch_u8" {
+            let next = row.at + row.raw.len();
+            let close = find(data, &[0xf8, 0x21, 0x21], next, end);
+            let cases = close.map_or_else(Vec::new, |close| {
+                (0..8)
+                    .filter_map(|case| {
+                        let marker = 0x18 + case;
+                        find(data, &[0xf8, marker, marker], next, close).map(|at| (case, at + 3))
+                    })
+                    .collect()
+            });
+            switches.push(NativeSwitch {
+                offset: row.at,
+                slot: row.raw[2],
+                end: close.map(|at| at + 3),
+                cases,
+            });
+        }
+        if kind == "condition" {
+            let next = row.at + row.raw.len();
+            let marker = condition_group(row.raw[1]);
+            let target = find(data, &[0xf8, marker, marker], next, end).map(|at| at + 3);
+            conditions.push((row.at, next, target));
+        }
+        if let [0xf8 | 0xf9, op @ 0x5b..=0x68, slot, operands @ ..] = row.raw.as_slice() {
+            let pointer = |slot: u8| {
+                let at = descriptor + 4 + 4 * usize::from(slot);
+                data.get(at..at + 4).map(|_| word(data, at))
+            };
+            if let Some(destination) = pointer(*slot) {
+                write!(caption, ", destination {destination:#010x}")?;
+            }
+            if matches!(op, 0x60 | 0x67)
+                && let [source] = operands
+                && let Some(source) = pointer(*source)
+            {
+                write!(caption, ", source {source:#010x}")?;
+            }
+        }
+        if let [0xf8 | 0xf9, 0x69 | 0x6a, slot] = row.raw.as_slice() {
+            let at = descriptor + 4 + 4 * usize::from(*slot);
+            if data.get(at..at + 4).is_some() {
+                write!(caption, ", source {:#010x}", word(data, at))?;
+            }
+        }
+        if kind == "effect_dispatch"
+            && let Some(table) = format.effect_dispatch
+        {
+            let selector = row.raw[2];
+            let index = if row.raw[1] >= 0x56 {
+                // The wide-argument form uses only the selector's low three bits.
+                let index = 0x38 + (selector & 7);
+                write!(caption, ", table index {index:#04x}")?;
+                index
+            } else {
+                selector
+            };
+            let at = table + 4 * usize::from(index);
+            if data.get(at..at + 4).is_some()
+                && let Some(handler) = (word(data, at) & !1).checked_sub(BASE)
+                && handler < data.len()
+            {
+                write!(caption, ", handler ROM offset {handler:#08x}")?;
+            }
+        }
+        writeln!(
+            listing,
+            "{:06x}\t{}\t{}\t{caption}",
+            row.at,
+            hex(&row.raw),
+            kind
+        )?;
+    }
+    Ok(Some(NativeListingOutput {
+        text: listing,
+        references: parsed.refs,
+        sound_requests,
+        conditions,
+        switches,
+    }))
 }
 
 fn semantic_commands(
@@ -473,24 +734,63 @@ fn semantic_commands(
         .collect()
 }
 
-pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()> {
-    let root_map = roots(data)?;
+pub(super) fn extract(
+    data: &[u8],
+    out: &Path,
+    semantic_out: &Path,
+    rom_sha256: &str,
+    pp4_v0: bool,
+) -> Result<()> {
+    let root_map = roots(data, pp4_v0)?;
     let chars = glyph_table(false);
-    let mut candidates = BTreeMap::new();
-    for desc in (0x50c000..0x5acd84).step_by(4) {
-        if let Some(bound) = bounds(data, desc) {
-            candidates.insert(desc, bound);
-        }
-    }
-    let mut first_desc = BTreeMap::new();
-    for (desc, (start, _)) in &candidates {
-        first_desc.entry(*start).or_insert(*desc);
-    }
-    candidates.retain(|desc, (start, _)| first_desc[start] == *desc);
-    let candidate_addrs = candidates.keys().copied().collect::<Vec<_>>();
-    candidates.retain(|desc, (start, _)| {
-        candidate_addrs.get(candidate_addrs.partition_point(|&x| x < *start)) == Some(desc)
-    });
+    let scan = if pp4_v0 {
+        (0x50c000 - 0x7cc)..(0x5acd84 - 0x878)
+    } else {
+        0x50c000..0x5acd84
+    };
+    let indexed_entrypoints = if pp4_v0 {
+        [
+            (0x55fa, 4),
+            (0x2d220, 55),
+            (0x2d246, 8),
+            (0x2d32a, 18),
+            (0x2d3da, 22),
+            (0x2df92, 13),
+            (0x2e02a, 6),
+            (0x2e094, 4),
+            (0x2e100, 7),
+            (0x2e982, 11),
+            (0x345d4, 6),
+            (0x3aa0a, 5),
+            (0x3aa26, 5),
+            (0x3c8b2, 85),
+            (0x3c94c, 9),
+            (0x3d1f2, 24),
+            (0x42fee, 24),
+        ]
+    } else {
+        [
+            (0x55fa, 4),
+            (0x2d30c, 55),
+            (0x2d332, 8),
+            (0x2d416, 18),
+            (0x2d4c6, 22),
+            (0x2e07e, 13),
+            (0x2e116, 6),
+            (0x2e180, 4),
+            (0x2e1ec, 7),
+            (0x2ea6e, 11),
+            (0x346c0, 6),
+            (0x3aafe, 5),
+            (0x3ab1a, 5),
+            (0x3c9a6, 85),
+            (0x3ca40, 9),
+            (0x3d2e6, 24),
+            (0x43136, 24),
+        ]
+    };
+    let entries = super::native_entrypoints(data, 0x6374, scan.start, &indexed_entrypoints);
+    let mut candidates = discover_descriptors(data, scan);
     for desc in root_map.keys() {
         candidates.insert(*desc, bounds(data, *desc).unwrap());
     }
@@ -502,7 +802,7 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
         {
             continue;
         }
-        results.insert(*desc, parse(data, *desc, *start, *end, &chars)?);
+        results.insert(*desc, parse(data, *desc, *start, *end, &chars, &[])?);
     }
     let mut queue = results.keys().copied().collect::<VecDeque<_>>();
     while let Some(desc) = queue.pop_front() {
@@ -511,7 +811,7 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
                 && let Some(bound) = bounds(data, target)
                 && let std::collections::btree_map::Entry::Vacant(entry) = results.entry(target)
             {
-                entry.insert(parse(data, target, bound.0, bound.1, &chars)?);
+                entry.insert(parse(data, target, bound.0, bound.1, &chars, &[])?);
                 candidates.insert(target, bound);
                 queue.push_back(target);
             }
@@ -524,8 +824,9 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
             visits.push_back((*desc, source.split('.').next().unwrap().to_string()));
         }
     }
+    let test_menu = if pp4_v0 { 0x5aa44c - 0x878 } else { 0x5aa44c };
     while let Some((key, mut route)) = visits.pop_front() {
-        if key == 0x5aa44c {
+        if key == test_menu {
             route = "test_menu".into();
         }
         if !results.contains_key(&key) || !route_sets.entry(key).or_default().insert(route.clone())
@@ -617,7 +918,7 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
         write_file(&out.join(&relative), &listing)?;
         let mut yaml = format!(
             "---\nformat_version: 1\ngame: \"pp4\"\nrom_sha256: {}\ndescriptor_offset: {}\nbody:\n  start_offset: {}\n  end_offset_exclusive: {}\n  sha256: {}\n  padding_hex: {}\nprovenance:\n  routes:",
-            quote(PP4_HASH),
+            quote(rom_sha256),
             quote(&format!("0x{desc:06x}")),
             quote(&format!("0x{start:06x}")),
             quote(&format!("0x{end:06x}")),
@@ -743,6 +1044,9 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
             issues.push((*desc, parsed.warnings.clone()));
         }
     }
+    super::write_entrypoints(out, &entries, |descriptor| {
+        results.contains_key(&descriptor)
+    })?;
     write_file(&out.join("index.tsv"), &index)?;
     write_file(&out.join("roots.tsv"), &root_rows)?;
     write_file(&out.join("edges.tsv"), &edge_rows)?;
@@ -777,9 +1081,10 @@ pub(super) fn extract(data: &[u8], out: &Path, semantic_out: &Path) -> Result<()
                 .join(", ")
         )
     };
+    let vm_dispatch = if pp4_v0 { 0x511a34 - 0x7cc } else { 0x511a34 };
     let manifest = format!(
-        "{{\n  \"rom_sha256\": {},\n  \"coverage\": {{\n{coverage}  }},\n  \"roundtrip_sha256\": {},\n  \"roundtrip_input\": \"sorted little-endian descriptor,body,end (u32), then body bytes\",\n  \"vm_dispatch\": \"0x511A34\",\n  \"partial_events\": {issue_json}\n}}\n",
-        quote(PP4_HASH),
+        "{{\n  \"rom_sha256\": {},\n  \"coverage\": {{\n{coverage}  }},\n  \"roundtrip_sha256\": {},\n  \"roundtrip_input\": \"sorted little-endian descriptor,body,end (u32), then body bytes\",\n  \"vm_dispatch\": \"0x{vm_dispatch:06X}\",\n  \"partial_events\": {issue_json}\n}}\n",
+        quote(rom_sha256),
         quote(&hex(&dig.finalize()))
     );
     write_file(&out.join("manifest.json"), &manifest)?;

@@ -37,9 +37,17 @@ impl Script {
                 )));
             }
             if let Some(condition) = &scene.condition {
-                condition.validate().map_err(|message| {
-                    LoadError::Invalid(format!("scene {:?}: {message}", scene.scene))
-                })?;
+                if condition.iter().next().is_none() {
+                    return Err(LoadError::Invalid(format!(
+                        "scene {:?}: if must list at least one condition",
+                        scene.scene
+                    )));
+                }
+                for condition in condition.iter() {
+                    condition.validate().map_err(|message| {
+                        LoadError::Invalid(format!("scene {:?}: {message}", scene.scene))
+                    })?;
+                }
             }
             validate_commands(
                 &scene.commands,
@@ -96,7 +104,7 @@ pub struct Scene {
     pub when: Option<NonZeroU32>,
     pub phase: Option<usize>,
     #[serde(rename = "if")]
-    pub condition: Option<Condition>,
+    pub condition: Option<SceneCondition>,
     pub prob: Option<u8>,
     pub commands: Vec<Command>,
 }
@@ -196,6 +204,23 @@ pub struct Case {
 pub enum Value {
     Integer(i64),
     Boolean(bool),
+}
+
+/// A scene entry condition: one comparison, or a list that must all match.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SceneCondition {
+    One(Condition),
+    All(Vec<Condition>),
+}
+
+impl SceneCondition {
+    pub fn iter(&self) -> std::slice::Iter<'_, Condition> {
+        match self {
+            Self::One(condition) => std::slice::from_ref(condition).iter(),
+            Self::All(conditions) => conditions.iter(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

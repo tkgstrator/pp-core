@@ -1,6 +1,6 @@
 //! SoundFont 2 bank for native program changes in extracted MIDI.
 use super::{
-    DRIVER_UPDATE_HZ, Game, Kind, Percussion, Sample,
+    DRIVER_UPDATE_HZ, Kind, Percussion, Playback, Sample, TrackFormat,
     sequence::{Decoded, decode},
     sha, synth,
 };
@@ -266,11 +266,8 @@ fn square(duty: u8) -> Vec<i16> {
         .map(|i| if i < positive { 8192 } else { -8192 })
         .collect()
 }
-fn wave(rom: &[u8], game: Game, slot: u8) -> Result<Vec<i16>> {
-    let base = match game {
-        Game::Pp4 => 0x0ced9c,
-        Game::Pp6 => 0x0fbd34,
-    } + slot as usize * 16;
+fn wave(rom: &[u8], playback: Playback, slot: u8) -> Result<Vec<i16>> {
+    let base = (playback.psg_periods + 0x280) + slot as usize * 16;
     let raw = rom
         .get(base..base + 16)
         .ok_or_else(|| anyhow::anyhow!("Wave slot outside ROM at {base:#x}"))?;
@@ -284,8 +281,8 @@ fn wave(rom: &[u8], game: Game, slot: u8) -> Result<Vec<i16>> {
     v.extend(copy);
     Ok(v)
 }
-fn noise(rom: &[u8], game: Game, source_pitch: u16) -> Vec<i16> {
-    let register = synth::noise_register(rom, game, source_pitch);
+fn noise(rom: &[u8], playback: Playback, source_pitch: u16) -> Vec<i16> {
+    let register = synth::noise_register(rom, playback, source_pitch);
     let divisor = ((register & 7) as u32 * 2).max(1);
     let clock = 524288.0 / (divisor as f64 * (1u32 << (register >> 4)) as f64);
     let cycle = synth::noise_cycle(register & 8 != 0);
@@ -299,7 +296,7 @@ fn noise(rom: &[u8], game: Game, source_pitch: u16) -> Vec<i16> {
 
 pub(super) fn write_soundfont(
     rom: &[u8],
-    game: Game,
+    playback: Playback,
     records: &[Sample],
     percussion: &[Percussion],
     keys: &PsgKeys,
@@ -316,12 +313,8 @@ pub(super) fn write_soundfont(
             36,
             if s.looped() { Some(s.loop_start) } else { None },
         )?;
-        let trans = if index
-            < match game {
-                Game::Pp4 => 45,
-                Game::Pp6 => 56,
-            } {
-            synth::transpose(rom, game, 0, index)?
+        let trans = if index < playback.sample_bases[1] {
+            synth::transpose(rom, playback, 0, index)?
         } else {
             0
         };
@@ -347,7 +340,7 @@ pub(super) fn write_soundfont(
         note_keys.insert(36);
         for key in note_keys {
             let source = ((key as i32 - 36) << 8) as u16;
-            let period = synth::psg_period(rom, game, source)?;
+            let period = synth::psg_period(rom, playback, source)?;
             let rate = (64.0 * 131072.0 / (2048 - period as u32) as f64).round_ties_even() as u32;
             let sample = builder.add_sample(
                 &format!("SQ{duty} K{key:03}"),
@@ -362,10 +355,10 @@ pub(super) fn write_soundfont(
     }
     for (&slot, note_keys) in &keys.wave {
         let mut zones = Vec::new();
-        let payload = wave(rom, game, slot)?;
+        let payload = wave(rom, playback, slot)?;
         for &key in note_keys {
             let source = ((key as i32 - 24) << 8) as u16;
-            let period = synth::psg_period(rom, game, source)?;
+            let period = synth::psg_period(rom, playback, source)?;
             let rate = (32.0 * 65536.0 / (2048 - period as u32) as f64).round_ties_even() as u32;
             let sample = builder.add_sample(
                 &format!("W{slot:02} K{key:03}"),
@@ -384,7 +377,7 @@ pub(super) fn write_soundfont(
     for key in noise_keys {
         let sample = builder.add_sample(
             &format!("NOISE K{key:03}"),
-            noise(rom, game, ((key as i32 - 36) << 8) as u16),
+            noise(rom, playback, ((key as i32 - 36) << 8) as u16),
             32768,
             key,
             Some(0),
@@ -400,11 +393,12 @@ pub(super) fn write_soundfont(
             (20.0 * DRIVER_UPDATE_HZ).round_ties_even() as usize,
             Kind::Noise,
             Some(5),
-            game,
+            playback,
+            TrackFormat::Legacy,
         )?;
         let (pcm, _, _) = synth::render_pcm(
             rom,
-            game,
+            playback,
             &[decoded],
             &[Kind::Noise],
             &[],
@@ -419,7 +413,7 @@ pub(super) fn write_soundfont(
         drum_zones.push(zone(sample, key, false));
     }
     builder.add_preset("ROM percussion", 128, 0, drum_zones)?;
-    let payload = builder.build(&format!("{} ROM sound bank", game.id().to_uppercase()));
+    let payload = builder.build(&format!("{} ROM sound bank", playback.id.to_uppercase()));
     fs::write(path, &payload)?;
     let square_count: usize = keys.square.values().map(|v| v.len()).sum();
     let wave_count: usize = keys.wave.values().map(|v| v.len()).sum();

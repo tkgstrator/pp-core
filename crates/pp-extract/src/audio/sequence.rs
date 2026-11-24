@@ -1,16 +1,28 @@
-use super::{Game, Kind, Percussion};
+use super::{Kind, Percussion, Playback};
 use anyhow::{Result, bail, ensure};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackFormat {
+    Legacy,
+    Pp7,
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct Token {
+    pub opcode: u8,
     pub end: usize,
 }
-pub(super) fn operand_count(opcode: u8, kind: Kind) -> usize {
+fn operand_count(opcode: u8, kind: Kind, format: TrackFormat) -> usize {
     if opcode < 0x80 {
         return 3
             - ((opcode & 0x10 != 0) as usize)
             - ((opcode & 0x20 != 0) as usize)
             - ((opcode & 0x40 != 0) as usize);
+    }
+    // PP7 PCM handlers (0x184a0/0x184e4) leave the stream pointer alone.
+    // The PSG handlers (0x1762c/0x17648) advance it by three bytes.
+    if format == TrackFormat::Pp7 && kind == Kind::Pcm && matches!(opcode, 0xf5 | 0xf6) {
+        return 0;
     }
     if (0xf1..=0xf6).contains(&opcode) {
         return 3;
@@ -26,14 +38,19 @@ pub(super) fn operand_count(opcode: u8, kind: Kind) -> usize {
     }
     0
 }
-pub(super) fn parse_linear(data: &[u8], offset: usize, kind: Kind) -> Result<Vec<Token>> {
+pub(super) fn parse_linear(
+    data: &[u8],
+    offset: usize,
+    kind: Kind,
+    format: TrackFormat,
+) -> Result<Vec<Token>> {
     let mut cursor = 0;
     let mut result = Vec::new();
     while cursor < data.len() {
         let at = cursor;
         let opcode = data[cursor];
         cursor += 1;
-        let count = operand_count(opcode, kind);
+        let count = operand_count(opcode, kind, format);
         ensure!(
             cursor + count <= data.len(),
             "Truncated sound opcode {opcode:#x} at {:#x}",
@@ -41,6 +58,7 @@ pub(super) fn parse_linear(data: &[u8], offset: usize, kind: Kind) -> Result<Vec
         );
         cursor += count;
         result.push(Token {
+            opcode,
             end: offset + cursor,
         });
         if opcode == 0xc0 {
@@ -110,17 +128,11 @@ impl StopReason {
 #[derive(Clone, Debug)]
 pub(super) struct Decoded {
     pub events: Vec<Event>,
+    pub sound_commands: Vec<(usize, usize, u8)>,
     pub stop_reason: StopReason,
     pub end_frame: usize,
-}
-impl Decoded {
-    fn done(events: Vec<Event>, stop_reason: StopReason, end_frame: usize) -> Self {
-        Self {
-            events,
-            stop_reason,
-            end_frame,
-        }
-    }
+    /// For `StopReason::Loop`, the frame the driver jumps back to.
+    pub loop_frame: Option<usize>,
 }
 fn signed8(x: u8) -> i32 {
     x as i8 as i32
@@ -149,7 +161,8 @@ pub(super) fn decode(
     max_frames: usize,
     kind: Kind,
     psg_type: Option<u8>,
-    game: Game,
+    playback: Playback,
+    format: TrackFormat,
 ) -> Result<Decoded> {
     ensure!(max_frames > 0, "max_frames must be positive");
     let mut cursor = 0usize;
@@ -173,12 +186,15 @@ pub(super) fn decode(
     let mut loop_voice = [0i32; 2];
     let mut loop_cursor = [None; 2];
     let mut loop_iteration = [0u32; 2];
+    let mut loop_frame = [None; 2];
     let mut unconditional_cursor = None;
+    let mut unconditional_frame = None;
     let mut conditional_cursor = None;
     let mut conditional_return = None;
     let mut conditional_state = 0u8;
     let mut active = None;
     let mut events = Vec::new();
+    let mut sound_commands = Vec::new();
     let mut commands = 0usize;
     for frame in 0..max_frames {
         phase += tempo;
@@ -213,7 +229,7 @@ pub(super) fn decode(
             let opcode = data[cursor];
             let start = cursor;
             cursor += 1;
-            let count = operand_count(opcode, kind);
+            let count = operand_count(opcode, kind, format);
             ensure!(
                 cursor + count <= data.len(),
                 "Truncated sound opcode at {:#x}",
@@ -221,6 +237,9 @@ pub(super) fn decode(
             );
             let operands = &data[cursor..cursor + count];
             cursor += count;
+            if format == TrackFormat::Pp7 && matches!(opcode, 0xf5 | 0xf6) {
+                sound_commands.push((frame, source_offset + start, opcode));
+            }
             if opcode < 0x80 {
                 let mut arg = 0;
                 if opcode & 0x10 == 0 {
@@ -267,10 +286,7 @@ pub(super) fn decode(
                     ((base * 17) as u8, (base * 8).clamp(1, 127) as u8)
                 };
                 let sample_index = if kind == Kind::Pcm {
-                    let banks: &[usize] = match game {
-                        Game::Pp4 => &[0, 45, 46],
-                        Game::Pp6 => &[0, 56],
-                    };
+                    let banks = playback.sample_bases;
                     ensure!(
                         sample_bank < banks.len(),
                         "Unknown PCM sample bank at {:#x}",
@@ -278,7 +294,7 @@ pub(super) fn decode(
                     );
                     let index = banks[sample_bank] + sample_local;
                     ensure!(
-                        index < if game == Game::Pp4 { 155 } else { 205 },
+                        index < playback.sample_count,
                         "PCM sample index out of range at {:#x}",
                         source_offset + start
                     );
@@ -321,17 +337,27 @@ pub(super) fn decode(
                     psg_type,
                     square_release,
                 );
-                return Ok(Decoded::done(events, StopReason::Terminator, frame));
+                return Ok(Decoded {
+                    events,
+                    sound_commands,
+                    stop_reason: StopReason::Terminator,
+                    end_frame: frame,
+                    loop_frame: None,
+                });
             }
             match opcode {
                 0xc1 | 0xc2 => {
                     let slot = (opcode - 0xc1) as usize;
                     loop_cursor[slot] = Some(cursor);
+                    loop_frame[slot] = Some(frame);
                     loop_iteration[slot] = 0;
                     loop_pitch[slot] = 0;
                     loop_voice[slot] = 0;
                 }
-                0xc3 => unconditional_cursor = Some(cursor),
+                0xc3 => {
+                    unconditional_cursor = Some(cursor);
+                    unconditional_frame = Some(frame);
+                }
                 0xc4 => {
                     conditional_cursor = Some(cursor);
                     conditional_state = 0;
@@ -362,7 +388,13 @@ pub(super) fn decode(
                         psg_type,
                         square_release,
                     );
-                    return Ok(Decoded::done(events, StopReason::Loop, frame));
+                    return Ok(Decoded {
+                        events,
+                        sound_commands,
+                        stop_reason: StopReason::Loop,
+                        end_frame: frame,
+                        loop_frame: unconditional_frame,
+                    });
                 }
                 0xd0 => tempo = operands[0] as u32,
                 0xd1 => {
@@ -435,7 +467,13 @@ pub(super) fn decode(
                             psg_type,
                             square_release,
                         );
-                        return Ok(Decoded::done(events, StopReason::Loop, frame));
+                        return Ok(Decoded {
+                            events,
+                            sound_commands,
+                            stop_reason: StopReason::Loop,
+                            end_frame: frame,
+                            loop_frame: loop_frame[slot],
+                        });
                     } else {
                         let bound = if kind == Kind::Pcm { 255 } else { 15 };
                         loop_voice[slot] =
@@ -474,14 +512,20 @@ pub(super) fn decode(
         psg_type,
         square_release,
     );
-    Ok(Decoded::done(events, StopReason::DurationCap, max_frames))
+    Ok(Decoded {
+        events,
+        sound_commands,
+        stop_reason: StopReason::DurationCap,
+        end_frame: max_frames,
+        loop_frame: None,
+    })
 }
 
 pub(super) fn expand_percussion(
     rom: &[u8],
     control: &Decoded,
     bank: &[Percussion],
-    game: Game,
+    playback: Playback,
     max_frames: usize,
 ) -> Result<Vec<Decoded>> {
     let mut templates = std::collections::HashMap::<usize, Decoded>::new();
@@ -508,7 +552,8 @@ pub(super) fn expand_percussion(
                 max_frames,
                 Kind::Noise,
                 Some(5),
-                game,
+                playback,
+                TrackFormat::Legacy,
             )?;
             templates.insert(index, decoded);
             &templates[&index]
@@ -542,7 +587,9 @@ pub(super) fn expand_percussion(
         }
         result.push(Decoded {
             events,
+            sound_commands: Vec::new(),
             end_frame,
+            loop_frame: None,
             stop_reason: if end_frame == max_frames {
                 StopReason::DurationCap
             } else {
@@ -555,13 +602,23 @@ pub(super) fn expand_percussion(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Game, original_playback};
     use super::*;
     #[test]
     fn note_cache_timing_and_pitch() {
         let data = [
             0xd0, 0x80, 0x09, 0x01, 0x02, 0x18, 0x39, 0x19, 0xd9, 0x03, 0xc0,
         ];
-        let d = decode(&data, 0x123400, 100, Kind::Square, Some(0), Game::Pp4).unwrap();
+        let d = decode(
+            &data,
+            0x123400,
+            100,
+            Kind::Square,
+            Some(0),
+            original_playback(Game::Pp4, false),
+            TrackFormat::Legacy,
+        )
+        .unwrap();
         let notes: Vec<_> = d
             .events
             .iter()
@@ -579,8 +636,9 @@ mod tests {
             let verified = crate::verify_rom(&path).unwrap();
             assert_eq!(verified.game, game);
             let rom = verified.bytes;
-            let (sequences, ends) = super::super::scan_sequences(&rom, game).unwrap();
-            let bank = super::super::scan_percussion(&rom, game).unwrap();
+            let layout = super::super::original_layout(game, false);
+            let (sequences, ends) = super::super::scan_sequences(&rom, game, &layout).unwrap();
+            let bank = super::super::scan_percussion(&rom, layout.percussion).unwrap();
             let song = sequences["bgm"].iter().find(|s| s.id == sound_id).unwrap();
             let channel = song.kinds.iter().position(|k| *k == Kind::Control).unwrap();
             let start = song.starts[channel];
@@ -590,10 +648,13 @@ mod tests {
                 100,
                 Kind::Control,
                 Some(3),
-                game,
+                original_playback(game, false),
+                TrackFormat::Legacy,
             )
             .unwrap();
-            let drums = expand_percussion(&rom, &control, &bank, game, 100).unwrap();
+            let drums =
+                expand_percussion(&rom, &control, &bank, original_playback(game, false), 100)
+                    .unwrap();
             let first: Vec<_> = drums[0]
                 .events
                 .iter()

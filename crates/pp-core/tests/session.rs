@@ -175,3 +175,61 @@ flags:
     session.advance().unwrap();
     assert!(session.state_changes().is_empty());
 }
+
+#[test]
+fn host_values_are_clamped_and_not_reported_as_script_changes() {
+    let script = Script::from_yaml(
+        "- scene: shop\n  if:\n    stat: money\n    ge: 3000\n  commands:\n    - type: text\n      text: [買える]\n    - type: sub\n      stat: money\n      value: 3000\n",
+    )
+    .unwrap();
+    let scenario = Scenario::from_yaml(
+        "start_scene: shop\nmax_turns: 4\nphases: [平日]\nstats:\n  money:\n    initial: 0\n    min: 0\n    max: 9999\nflags:\n  seen: false\n",
+    )
+    .unwrap();
+    let mut session = Session::new(script, scenario, "あおい").unwrap();
+    assert!(session.trigger(1, 0, || 0).unwrap().is_empty());
+    session.set_stat("money", 20_000).unwrap();
+    session.set_flag("seen", true).unwrap();
+    assert!(session.state_changes().is_empty());
+    assert_eq!(session.view().stats["money"], 9999);
+    assert!(session.view().flags["seen"]);
+    assert!(session.set_stat("unknown", 1).is_err());
+    assert!(session.set_flag("unknown", true).is_err());
+    session.trigger(1, 0, || 0).unwrap();
+    session.advance().unwrap();
+    assert_eq!(session.view().stats["money"], 6999);
+    assert_eq!(session.state_changes().len(), 1);
+}
+
+#[test]
+fn scene_conditions_can_require_every_comparison() {
+    let script = Script::from_yaml(
+        "- scene: once\n  if:\n    - stat: action\n      eq: 2\n    - flag: seen\n      eq: false\n  commands:\n    - type: set\n      flag: seen\n      value: true\n    - type: text\n      text: [初回]\n- scene: fallback\n  if:\n    stat: action\n    eq: 2\n  commands:\n    - type: text\n      text: [二回目以降]\n",
+    )
+    .unwrap();
+    let scenario = Scenario::from_yaml(
+        "start_scene: once\nmax_turns: 4\nphases: [平日]\nstats:\n  action:\n    initial: 0\nflags:\n  seen: false\n",
+    )
+    .unwrap();
+    let mut session = Session::new(script, scenario, "あおい").unwrap();
+    assert!(session.trigger(1, 0, || 0).unwrap().is_empty());
+    assert!(matches!(session.view().pause, Pause::Ended));
+    session.set_stat("action", 2).unwrap();
+    session.trigger(1, 0, || 0).unwrap();
+    assert!(matches!(session.view().pause, Pause::Text { text, .. } if text == "初回"));
+    session.advance().unwrap();
+    session.trigger(2, 0, || 0).unwrap();
+    assert!(matches!(session.view().pause, Pause::Text { text, .. } if text == "二回目以降"));
+    assert!(Script::from_yaml("- scene: empty\n  if: []\n  commands: []\n").is_err());
+    assert!(
+        Scenario::from_yaml("start_scene: once\nmax_turns: 4\nphases: [平日]\n")
+            .unwrap()
+            .verify(
+                &Script::from_yaml(
+                    "- scene: once\n  if:\n    - flag: missing\n      eq: true\n  commands: []\n"
+                )
+                .unwrap()
+            )
+            .is_err()
+    );
+}

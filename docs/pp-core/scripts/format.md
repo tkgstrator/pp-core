@@ -210,6 +210,21 @@ Rust の再生側は、到達した命令を `pp_core::presentation::Presentatio
 
 条件は `stat` または `flag` のどちらか一つと、比較演算子一つを指定します。整数には `eq`、`ne`、`lt`、`le`、`gt`、`ge` を、真偽値には `eq`、`ne` を使えます。入口の `if` とコマンドの `condition` は同じ書式です。
 
+シーン入口の `if` には条件の配列も書けます。配列のときは、すべての条件を満たした場合だけ候補になります。前のイベントを見たことを示すフラグと組み合わせると、イベントを順番に発生させられます。
+
+```yaml
+- scene: second_visit
+  if:
+    - flag: seen_first_visit
+      eq: true
+    - stat: trust
+      ge: 50
+  commands:
+    - type: text
+      text:
+        - また来てくれたんだ。
+```
+
 ```yaml
 - type: if
   condition:
@@ -286,3 +301,5 @@ phases:
 `pp_core::session::Session` はスクリプト、進行位置、表示状態、シナリオの状態を保持します。セッション作成時に `scenario.yaml` とスクリプトの参照を検証します。
 
 `start_configured` は設定の開始シーンを開きます。`trigger` はターン番号とフェーズ ID を指定して対象イベントを探します。Web UI の開始ボタンは設定の開始シーンを使います。進行中は `advance` でセリフを送り、`choose` に選択肢のゼロ始まりの番号を渡し、`resume` で待機を解除します。WASM の各操作は、更新後の状態と、その操作で発生した音声・エフェクトのイベントを返します。
+
+育成シミュレーションなど、ホスト側が持つ値は `set_stat` と `set_flag` でシナリオに書き込めます。値は設定の範囲に丸められ、スクリプトによる変更履歴には記録されません。WASM の `trigger_seeded` は `trigger` と同じ探索を、シードから決まる確率判定で行います。同じシードと入力の列で、同じ進行を再生できます。`view` はコマンドを実行せずに現在の状態を返します。

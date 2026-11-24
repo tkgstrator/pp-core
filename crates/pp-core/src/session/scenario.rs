@@ -71,7 +71,11 @@ impl Scenario {
             {
                 errors.push(format!("{path}.phase: phase ID {phase} is out of range"));
             }
-            if let Some(condition) = &scene.condition {
+            for condition in scene
+                .condition
+                .iter()
+                .flat_map(|condition| condition.iter())
+            {
                 self.validate_state(
                     condition.stat.as_deref(),
                     condition.flag.as_deref(),

@@ -87,10 +87,10 @@ fn blit_piece(
 
 // ---------------------------------------------------------------- PP4
 
-fn pp4_bank_header(rom: &[u8], header: usize, expected: usize) -> Result<usize> {
+fn bank_header(rom: &[u8], header: usize, expected: usize) -> Result<(u16, usize)> {
     let (compression, count) = (u16_at(rom, header)?, u16_at(rom, header + 2)?);
-    if compression != 1 || count as usize != expected {
-        bail!("Unexpected PP4 bank header at {header:#x}");
+    if compression > 1 || count as usize != expected {
+        bail!("Unexpected portrait bank header at {header:#x}");
     }
     if header + 8 + 4 * expected > rom.len() {
         bail!("PP4 bank layout table outside ROM at {header:#x}");
@@ -99,14 +99,15 @@ fn pp4_bank_header(rom: &[u8], header: usize, expected: usize) -> Result<usize> 
     if graphics + 4 * expected > rom.len() {
         bail!("PP4 graphics table outside ROM at {header:#x}");
     }
-    Ok(graphics)
+    Ok((compression, graphics))
 }
 
-fn pp4_layer(
+fn bust_layer(
     rom: &[u8],
     header: usize,
     graphics: usize,
     index: usize,
+    compression: u16,
 ) -> Result<(RgbaImage, Value)> {
     let record = rom_pointer(rom, graphics + 4 * index)?;
     let source = rom_pointer(rom, record)?;
@@ -121,7 +122,15 @@ fn pp4_layer(
     }
     let tile_base = ((destination - OBJ_START) / 32) as i64;
     let length = length as usize;
-    let (tiles, end) = gba::decompress(rom, source, length)?;
+    let (tiles, end) = if compression == 1 {
+        gba::decompress(rom, source, length)?
+    } else {
+        let end = source + length;
+        let Some(raw) = rom.get(source..end) else {
+            bail!("Raw OBJ tiles outside ROM at {source:#x}");
+        };
+        (raw.to_vec(), end)
+    };
 
     let palette_group = rom_pointer(rom, record + 12)?;
     if u32_at(rom, palette_group)? != 1 {
@@ -183,9 +192,14 @@ fn pp4_layer(
     let Some(bbox) = gba::alpha_bbox(&image) else {
         bail!("Empty PP4 bust at {header:#x} index {index}");
     };
+    let (start_key, end_key) = if compression == 1 {
+        ("rle_start", "rle_end_exclusive")
+    } else {
+        ("raw_start", "raw_end_exclusive")
+    };
     let info = json!({
         "index": index, "graphics_record": hex(record as u64),
-        "rle_start": hex(source as u64), "rle_end_exclusive": hex(end as u64),
+        (start_key): hex(source as u64), (end_key): hex(end as u64),
         "expanded_bytes": length, "expanded_sha256": gba::sha256_hex(&tiles),
         "vram_destination": hex(destination), "source_tile_base": tile_base,
         "palette_group": hex(palette_group as u64), "palette": hex(palette_source as u64),
@@ -236,15 +250,60 @@ fn pp4_contact_sheets(
 
 pub fn extract_pp4(rom: &[u8], root: &Path) -> Result<Value> {
     let digest = gba::sha256_hex(rom);
-    if digest != Game::Pp4.expected_sha256() {
+    let relocation = if digest == Game::Pp4.expected_sha256() {
+        0
+    } else if digest == crate::rom::PP4_V0_SHA256 {
+        0x878
+    } else {
         bail!("Unsupported PP4 ROM SHA-256: {digest}");
+    };
+    let banks = PP4_BANKS.map(|(header, count)| (header - relocation, count));
+    export_busts(
+        rom,
+        root,
+        &banks,
+        "seven structurally verified 56x56 OBJ bust banks; likely dialogue portraits",
+    )
+}
+
+pub(crate) fn discover_busts(rom: &[u8]) -> Vec<(usize, usize)> {
+    let mut banks = Vec::new();
+    for (word, prefix) in rom.windows(8).step_by(4).enumerate() {
+        let compression = u16::from_le_bytes([prefix[0], prefix[1]]);
+        let count = usize::from(u16::from_le_bytes([prefix[2], prefix[3]]));
+        if compression > 1 || !(4..=512).contains(&count) {
+            continue;
+        }
+        let header = word * 4;
+        let Ok((compression, graphics)) = bank_header(rom, header, count) else {
+            continue;
+        };
+        // Check the first pair of pointers and the fixed tile size before rendering.
+        let Some(record) = rom_pointer(rom, graphics).ok() else {
+            continue;
+        };
+        if u32_at(rom, record + 8).ok() != Some(0x620) {
+            continue;
+        }
+        if (0..count).all(|index| bust_layer(rom, header, graphics, index, compression).is_ok()) {
+            banks.push((header, count));
+        }
     }
+    banks
+}
+
+pub(crate) fn export_busts(
+    rom: &[u8],
+    root: &Path,
+    bank_layout: &[(usize, usize)],
+    classification: &str,
+) -> Result<Value> {
     let (mut banks, mut sheets) = (Vec::new(), Vec::new());
-    for (header, expected) in PP4_BANKS {
-        let graphics = pp4_bank_header(rom, header, expected)?;
+    for &(header, expected) in bank_layout {
+        let (compression, graphics) = bank_header(rom, header, expected)?;
         let (mut assets, mut images) = (Vec::new(), Vec::new());
         for index in 0..expected {
-            let (image, info) = pp4_layer(rom, header, graphics, index)?;
+            let (image, info) = bust_layer(rom, header, graphics, index, compression)?;
             let relative = format!("banks/{header:06x}/{index:03}.png");
             gba::save_png(&image, &root.join(&relative))?;
             let mut asset = json!({ "png": relative });
@@ -258,14 +317,14 @@ pub fn extract_pp4(rom: &[u8], root: &Path) -> Result<Value> {
         let bank_sheets = pp4_contact_sheets(root, header, &images)?;
         sheets.extend(bank_sheets.iter().cloned());
         banks.push(json!({
-            "header": hex(header as u64), "compression": 1, "count": expected,
+            "header": hex(header as u64), "compression": compression, "count": expected,
             "graphics_table": hex(graphics as u64), "assets": assets, "contact_sheets": bank_sheets,
         }));
     }
-    let pngs: usize = PP4_BANKS.iter().map(|b| b.1).sum();
+    let pngs: usize = bank_layout.iter().map(|b| b.1).sum();
     let manifest = json!({
-        "rom_game_code": "AP4J", "rom_sha256": digest,
-        "classification": "seven structurally verified 56x56 OBJ bust banks; likely dialogue portraits",
+        "rom_game_code": String::from_utf8_lossy(&rom[0xac..0xb0]), "rom_sha256": gba::sha256_hex(rom),
+        "classification": classification,
         "actor_style_mapping": "unverified", "runtime_coverage": "unverified",
         "file_offsets": "hex, zero based, without GBA bus base 0x08000000",
         "pixel_format": "RGBA8, GBA BGR555 scaled by floor(n*255/31), OBJ palette index 0 transparent",
@@ -369,6 +428,113 @@ fn write_pose(
     Ok((entry, trimmed))
 }
 
+pub(crate) struct PortraitBank {
+    pub header: usize,
+    pub count: usize,
+    pub dialogue_id_base: Option<usize>,
+}
+
+pub(crate) fn export_layers(
+    rom: &[u8],
+    root: &Path,
+    bank_layout: &[PortraitBank],
+    remap_tables: Option<[usize; 2]>,
+) -> Result<()> {
+    let mut banks = Vec::new();
+    for &PortraitBank {
+        header,
+        count,
+        dialogue_id_base,
+    } in bank_layout
+    {
+        let (compression, graphics) = bank_header(rom, header, count)?;
+        if compression != 1 {
+            bail!("Expected compressed portrait layers at {header:#x}");
+        }
+        let mut assets = Vec::new();
+        for index in 0..count {
+            let Layer { image, info } = pp6_layer(rom, header, graphics, index)?;
+            let mut entry = info.as_object().unwrap().clone();
+            if let Some(base) = dialogue_id_base {
+                entry.insert("dialogue_portrait_id".into(), json!(base + index));
+            }
+            if gba::alpha_bbox(&image).is_some() {
+                let path = format!("layers/{header:06x}/{index:03}.png");
+                let (pose, _) = write_pose(&image, root, &path)?;
+                entry.extend(pose);
+            } else {
+                entry.insert("empty".into(), json!(true));
+            }
+            assets.push(entry);
+        }
+        banks.push(json!({
+            "header": hex(header as u64),
+            "graphics_table": hex(graphics as u64),
+            "count": count,
+            "assets": assets,
+        }));
+    }
+    let mapped = bank_layout
+        .iter()
+        .all(|bank| bank.dialogue_id_base.is_some());
+    let mut manifest = json!({
+        "rom_game_code": String::from_utf8_lossy(&rom[0xac..0xb0]),
+        "rom_sha256": gba::sha256_hex(rom),
+        "classification": "dialogue portrait banks",
+        "actor_style_mapping": if mapped {
+            "dialogue portrait IDs from the runtime bank selector"
+        } else {
+            "scene-dependent dialogue portrait IDs from the runtime callbacks"
+        },
+        "banks": banks,
+    });
+    if let Some(tables) = remap_tables {
+        manifest["dialogue_portrait_map"] = pp12_dialogue_map(rom, bank_layout, tables)?;
+    }
+    write_manifest(root, &manifest)
+}
+
+fn pp12_dialogue_map(rom: &[u8], banks: &[PortraitBank], tables: [usize; 2]) -> Result<Value> {
+    // The setup routine at 0x3abfc swaps the two banks when either
+    // scenario-state word is nonzero. Only the left callbacks remap indices.
+    const CALLBACK_ID_COUNT: usize = 245;
+    let mut configurations = Vec::new();
+    for alternate in [false, true] {
+        let mut routes = Vec::new();
+        for id_group in 0..2 {
+            let bank_index = id_group ^ usize::from(alternate);
+            let bank = &banks[bank_index];
+            let table = tables[bank_index];
+            let remaps = rom
+                .get(table..table + CALLBACK_ID_COUNT)
+                .ok_or_else(|| anyhow::anyhow!("Portrait remap outside ROM at {table:#x}"))?;
+            for (index, &remap) in remaps.iter().enumerate() {
+                let left_index = if remap == 0 {
+                    index
+                } else {
+                    usize::from(remap)
+                };
+                routes.push(json!({
+                    "dialogue_portrait_id": id_group * 0x100 + index,
+                    "bank_header": hex(bank.header as u64),
+                    "left_asset_index": (left_index < bank.count).then_some(left_index),
+                    "right_asset_index": (index < bank.count).then_some(index),
+                    "left_x_shift": if remap == 0 { 0 } else { 56 },
+                }));
+            }
+        }
+        configurations.push(json!({
+            "state": if alternate { "either_nonzero" } else { "both_zero" },
+            "routes": routes,
+        }));
+    }
+    Ok(json!({
+        "state_word_addresses": ["0x03002600", "0x03002464"],
+        "left_remap_table_offsets": tables.map(|offset| hex(offset as u64)),
+        "configurations": configurations,
+    }))
+}
+
 fn pp6_contact_sheets(root: &Path, actors: &[(u32, RgbaImage)]) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for page in actors.chunks(80) {
@@ -398,7 +564,7 @@ fn pp6_contact_sheets(root: &Path, actors: &[(u32, RgbaImage)]) -> Result<Vec<St
 
 pub fn extract_pp6(rom: &[u8], root: &Path) -> Result<Value> {
     let sha256 = gba::sha256_hex(rom);
-    if sha256 != Game::Pp6.expected_sha256() {
+    if !Game::Pp6.accepts_sha256(&sha256) {
         bail!("Unsupported ROM SHA-256: {sha256}");
     }
     let mut layers: Vec<(&str, Vec<Layer>)> = Vec::new();
@@ -631,5 +797,21 @@ mod tests {
                 .to_string()
                 .contains("Unsupported ROM")
         );
+    }
+}
+
+#[cfg(test)]
+mod bust_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn discovers_the_same_bust_banks_in_both_pp5_retail_variants() {
+        for id in ["pp5_v0", "pp5_v0_p"] {
+            let Some(path) = crate::test_assets::rom(id) else {
+                continue;
+            };
+            let (profile, rom) = crate::rom::verify_supported_rom(&path).unwrap();
+            assert_eq!(discover_busts(&rom), profile.busts, "{id}");
+        }
     }
 }
