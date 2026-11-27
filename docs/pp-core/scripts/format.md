@@ -277,6 +277,8 @@ assert!(report.is_ok(), "{report:?}");
 
 この検証ではプレイヤーの選択やフラグの値を可能な範囲で分岐として扱います。状態更新の結果や、同一フェーズで優先されるイベントの判定にはシナリオの実行が必要です。
 
+選択肢を一行で表示する画面では、`Script::verify_choice_labels` に表示幅の上限と文字列を測る関数を渡します。デバッグ専用シーンも含めてすべての枝を調べ、改行か幅の超過があればシーン ID・位置・ラベルを返します。フォントのグリフ索引（`文字: [x, y, 幅]`）で調べるには `cargo run -p pp-core --example verify-choice-labels -- 208 dialogue-index.json < script.yaml` を使えます。索引のない文字は12ドットとして数えます。
+
 ## シナリオ設定
 
 スクリプトとは別に [`scenario.yaml`](../../../web/scenario.yaml) が必要です。必須項目は以下の3つです。

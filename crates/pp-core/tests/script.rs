@@ -146,3 +146,42 @@ fn recognizes_exhaustive_switch_and_shadowed_cases() {
         ]
     );
 }
+
+#[test]
+fn verifies_the_display_width_of_choice_labels_even_in_nested_and_debug_scenes() {
+    let script = Script::from_yaml(
+        r#"- scene: start
+  commands:
+    - type: choice
+      options:
+        - text: あいうえおかきくけこさしすせそたち
+          commands:
+            - type: if
+              condition: {flag: ready, eq: true}
+              then:
+                - type: choice
+                  options:
+                    - text: あいうえおかきくけこさしすせそたちつ
+                      commands: []
+              else: []
+- scene: debug
+  commands:
+    - type: choice
+      options:
+        - text: "改行\nあり"
+          commands: []
+"#,
+    )
+    .unwrap();
+    let issues = script.verify_choice_labels(208, |label| label.chars().count() * 12);
+    assert_eq!(issues.len(), 2);
+    assert_eq!(issues[0].scene, "start");
+    assert_eq!(
+        issues[0].path,
+        "commands[0].options[0].commands[0].then[0].options[0].text"
+    );
+    assert_eq!(issues[0].width, 216);
+    assert!(!issues[0].multiline);
+    assert_eq!(issues[1].scene, "debug");
+    assert!(issues[1].multiline);
+}

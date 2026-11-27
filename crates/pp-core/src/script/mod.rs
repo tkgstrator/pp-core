@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
-pub use verify::{UnreachableCommand, VerifyReport};
+pub use verify::{ChoiceLabelIssue, UnreachableCommand, VerifyReport};
 
 /// An ordered set of scenes with unique IDs and resolved jump destinations.
 #[derive(Debug)]

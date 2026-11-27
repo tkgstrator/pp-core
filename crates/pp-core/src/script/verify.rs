@@ -21,7 +21,38 @@ pub struct UnreachableCommand {
     pub path: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChoiceLabelIssue {
+    pub scene: String,
+    /// Zero-based path to the offending option's text.
+    pub path: String,
+    pub label: String,
+    pub width: usize,
+    pub multiline: bool,
+}
+
 impl Script {
+    /// Checks every choice label, including debug-only scenes and nested branches.
+    /// The frontend supplies the one-line width limit and its text measurement.
+    pub fn verify_choice_labels(
+        &self,
+        max_width: usize,
+        measure: impl Fn(&str) -> usize,
+    ) -> Vec<ChoiceLabelIssue> {
+        let mut issues = Vec::new();
+        for scene in self.scenes() {
+            check_choices(
+                &scene.commands,
+                &scene.scene,
+                "commands",
+                max_width,
+                &measure,
+                &mut issues,
+            );
+        }
+        issues
+    }
+
     /// Checks reachability from the first scene and every eligible event entry.
     ///
     /// Conditions and player choices are treated as possible outcomes. This does
@@ -76,6 +107,44 @@ impl Script {
             .map(|(_, scene)| scene.scene.clone())
             .collect();
         report
+    }
+}
+
+fn check_choices(
+    commands: &[Command],
+    scene: &str,
+    path: &str,
+    max_width: usize,
+    measure: &impl Fn(&str) -> usize,
+    issues: &mut Vec<ChoiceLabelIssue>,
+) {
+    for (i, command) in commands.iter().enumerate() {
+        let path = format!("{path}[{i}]");
+        if let Command::Choice { options } = command {
+            for (option_index, option) in options.iter().enumerate() {
+                let width = measure(&option.text);
+                let multiline = option.text.contains(['\r', '\n']);
+                if width > max_width || multiline {
+                    issues.push(ChoiceLabelIssue {
+                        scene: scene.into(),
+                        path: format!("{path}.options[{option_index}].text"),
+                        label: option.text.clone(),
+                        width,
+                        multiline,
+                    });
+                }
+            }
+        }
+        for (branch, commands) in command.branches() {
+            check_choices(
+                commands,
+                scene,
+                &format!("{path}.{branch}"),
+                max_width,
+                measure,
+                issues,
+            );
+        }
     }
 }
 
