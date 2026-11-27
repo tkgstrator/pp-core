@@ -279,6 +279,8 @@ assert!(report.is_ok(), "{report:?}");
 
 選択肢を一行で表示する画面では、`Script::verify_choice_labels` に表示幅の上限と文字列を測る関数を渡します。デバッグ専用シーンも含めてすべての枝を調べ、改行か幅の超過があればシーン ID・位置・ラベルを返します。フォントのグリフ索引（`文字: [x, y, 幅]`）で調べるには `cargo run -p pp-core --example verify-choice-labels -- 208 dialogue-index.json < script.yaml` を使えます。索引のない文字は12ドットとして数えます。
 
+`Script::verify_relationship_changes` は話者IDと関係パラメータの対応を受け取り、話した人物の値を更新しない経路を報告します。`Script::verify_protagonist_replies` は呼びかけと返答の命令位置を受け取り、一方しかない経路を報告します。どちらも合流や `go` をたどり、指定されたイベント境界で確認します。条件式やパラメータ上限までは実行せず、経路内の更新命令を調べます。例の `--audit` モードでは、画面表示用に整形済みの台詞とラベルをフォント索引と照合することもできます。
+
 ## シナリオ設定
 
 スクリプトとは別に [`scenario.yaml`](../../../web/scenario.yaml) が必要です。必須項目は以下の3つです。

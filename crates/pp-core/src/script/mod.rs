@@ -1,4 +1,5 @@
 mod verify;
+mod verify_relationships;
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
@@ -6,6 +7,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Serialize};
 
 pub use verify::{ChoiceLabelIssue, UnreachableCommand, VerifyReport};
+pub use verify_relationships::{DialogueWarning, ScriptSite, SelectedBranch};
 
 /// An ordered set of scenes with unique IDs and resolved jump destinations.
 #[derive(Debug)]
