@@ -281,6 +281,8 @@ assert!(report.is_ok(), "{report:?}");
 
 `Script::verify_relationship_changes` は話者IDと関係パラメータの対応を受け取り、話した人物の値を更新しない経路を報告します。`Script::verify_protagonist_replies` は呼びかけと返答の命令位置を受け取り、一方しかない経路を報告します。どちらも合流や `go` をたどり、指定されたイベント境界で確認します。条件式やパラメータ上限までは実行せず、経路内の更新命令を調べます。例の `--audit` モードでは、画面表示用に整形済みの台詞とラベルをフォント索引と照合することもできます。
 
+`Script::verify_protagonist_presence` はイベント内のどの経路にも主人公が登場しない場合を報告します。`Script::verify_thought_portraits` は心の声の命令位置を受け取り、そこに至る経路のいずれかで主人公の立ち絵が左にいない場合を報告します。どちらも台本を無効にするエラーではありません。
+
 ## シナリオ設定
 
 スクリプトとは別に [`scenario.yaml`](../../../web/scenario.yaml) が必要です。必須項目は以下の3つです。

@@ -1,4 +1,5 @@
 use pp_core::script::Script;
+use pp_core::script::ScriptSite;
 
 #[test]
 fn checks_actual_branch_continuations_without_borrowing_another_paths_change() {
@@ -93,4 +94,34 @@ fn a_shared_effect_after_a_choice_covers_every_path_that_reaches_it() {
             .verify_relationship_changes(&speakers, None)
             .is_empty()
     );
+}
+
+#[test]
+fn a_thought_needs_the_protagonist_on_the_left_in_each_branch() {
+    let script = Script::from_yaml(
+        r#"
+- scene: choice
+  commands:
+    - type: choice
+      options:
+        - text: 左
+          commands: [{type: left, asset: 'protagonist:neutral'}]
+        - text: 右
+          commands: [{type: right, asset: 'protagonist:neutral'}]
+    - {type: text, speaker: protagonist, text: [（どうしよう。）]}
+- scene: offscreen
+  commands:
+    - {type: text, text: [主人公は来なかった。]}
+"#,
+    )
+    .unwrap();
+    let thought = ScriptSite {
+        scene: "choice".into(),
+        path: "commands[1]".into(),
+    };
+    assert_eq!(
+        script.verify_thought_portraits(std::slice::from_ref(&thought)),
+        [thought]
+    );
+    assert_eq!(script.verify_protagonist_presence(), ["offscreen"]);
 }

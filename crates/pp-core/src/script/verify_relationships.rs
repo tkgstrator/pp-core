@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use super::{Command, Script, Value};
+mod stage;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Deserialize, Serialize)]
 pub struct ScriptSite {
@@ -86,6 +87,7 @@ enum Step<'a> {
     Branch(Vec<usize>),
     Decision { label: String, choice: bool },
     Text(&'a str),
+    Portrait { left: bool, asset: Option<&'a str> },
     Write(&'a str),
     Go(&'a str),
     Boundary,
@@ -170,6 +172,14 @@ impl<'a> Graph<'a> {
                         speaker: Some(speaker),
                         ..
                     } => Step::Text(speaker),
+                    Command::Left { asset } => Step::Portrait {
+                        left: true,
+                        asset: asset.as_deref(),
+                    },
+                    Command::Right { asset } => Step::Portrait {
+                        left: false,
+                        asset: asset.as_deref(),
+                    },
                     Command::Add { stat, value } | Command::Sub { stat, value } if *value != 0 => {
                         Step::Write(stat)
                     }

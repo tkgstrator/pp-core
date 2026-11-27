@@ -13,6 +13,7 @@ struct AuditInput {
     event_boundary: String,
     addresses: Vec<ScriptSite>,
     replies: Vec<ScriptSite>,
+    thoughts: Vec<ScriptSite>,
     glyph_texts: Vec<String>,
 }
 
@@ -20,6 +21,8 @@ struct AuditInput {
 struct AuditResult {
     dialogue: Vec<DialogueWarning>,
     missing_glyphs: Vec<(usize, BTreeSet<char>)>,
+    absent_protagonist: Vec<String>,
+    missing_thought_portraits: Vec<ScriptSite>,
 }
 
 fn run() -> Result<bool, Box<dyn Error>> {
@@ -84,7 +87,9 @@ fn run() -> Result<bool, Box<dyn Error>> {
             "{}",
             serde_saphyr::to_string(&AuditResult {
                 dialogue,
-                missing_glyphs
+                missing_glyphs,
+                absent_protagonist: script.verify_protagonist_presence(),
+                missing_thought_portraits: script.verify_thought_portraits(&audit.thoughts),
             })?
         );
     }
