@@ -6,6 +6,9 @@ use std::process::ExitCode;
 use pp_core::script::{DialogueWarning, Script, ScriptSite};
 use serde::{Deserialize, Serialize};
 
+#[path = "verify_choice_labels/name_colors.rs"]
+mod name_colors;
+
 #[derive(Deserialize)]
 struct AuditInput {
     source: String,
@@ -15,14 +18,17 @@ struct AuditInput {
     replies: Vec<ScriptSite>,
     thoughts: Vec<ScriptSite>,
     glyph_texts: Vec<String>,
+    #[serde(default)]
+    name_colors: name_colors::NameColorAudit,
 }
 
 #[derive(Serialize)]
-struct AuditResult {
+struct AuditResult<'a> {
     dialogue: Vec<DialogueWarning>,
     missing_glyphs: Vec<(usize, BTreeSet<char>)>,
     absent_protagonist: Vec<String>,
     missing_thought_portraits: Vec<ScriptSite>,
+    uncolored_names: Vec<(usize, BTreeSet<&'a str>)>,
 }
 
 fn run() -> Result<bool, Box<dyn Error>> {
@@ -90,6 +96,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
                 missing_glyphs,
                 absent_protagonist: script.verify_protagonist_presence(),
                 missing_thought_portraits: script.verify_thought_portraits(&audit.thoughts),
+                uncolored_names: audit.name_colors.warnings(),
             })?
         );
     }
